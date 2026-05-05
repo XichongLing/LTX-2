@@ -38,14 +38,14 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.constants import (
-    DISTILLED_SIGMA_VALUES,
-    STAGE_2_DISTILLED_SIGMA_VALUES,
+    DISTILLED_SIGMAS,
+    STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
 from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class ICLoraPipeline:
@@ -74,12 +74,18 @@ class ICLoraPipeline:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
 
         self.prompt_encoder = PromptEncoder(
-            distilled_checkpoint_path, gemma_root, self.dtype, self.device, registry=registry
+            distilled_checkpoint_path,
+            gemma_root,
+            self.dtype,
+            self.device,
+            registry=registry,
+            offload_mode=offload_mode,
         )
         self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
         self.stage_1 = DiffusionStage(
@@ -90,6 +96,7 @@ class ICLoraPipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.stage_2 = DiffusionStage(
             distilled_checkpoint_path,
@@ -99,6 +106,7 @@ class ICLoraPipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
             distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
@@ -136,7 +144,8 @@ class ICLoraPipeline:
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
-        streaming_prefetch_count: int | None = None,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -184,7 +193,6 @@ class ICLoraPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -216,7 +224,7 @@ class ICLoraPipeline:
             )
         )
 
-        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
         video_state, audio_state = self.stage_1(
             denoiser=SimpleDenoiser(video_context, audio_context),
@@ -233,7 +241,6 @@ class ICLoraPipeline:
             audio=ModalitySpec(
                 context=audio_context,
             ),
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         if video_state is not None:
             logging.info(f"[IC-LoRA] Stage 1 output latent shape: {tuple(video_state.latent.shape)}")
@@ -254,7 +261,7 @@ class ICLoraPipeline:
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
         logging.info(f"[IC-LoRA] Stage 2 input latent shape: {tuple(upscaled_video_latent.shape)}")
 
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         logging.info(
             "[IC-LoRA] Stage 2 target pixel shape: "
@@ -274,7 +281,7 @@ class ICLoraPipeline:
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(video_context, audio_context),
-            sigmas=distilled_sigmas,
+            sigmas=stage_2_sigmas,
             noiser=noiser,
             width=width,
             height=height,
@@ -283,15 +290,14 @@ class ICLoraPipeline:
             video=ModalitySpec(
                 context=video_context,
                 conditionings=stage_2_conditionings,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
                 context=audio_context,
-                noise_scale=distilled_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         if video_state is not None:
             logging.info(f"[IC-LoRA] Stage 2 output latent shape: {tuple(video_state.latent.shape)}")
@@ -498,6 +504,7 @@ def main() -> None:
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
@@ -514,7 +521,6 @@ def main() -> None:
         conditioning_attention_strength=conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
-        streaming_prefetch_count=args.streaming_prefetch_count,
     )
 
     encode_video(
