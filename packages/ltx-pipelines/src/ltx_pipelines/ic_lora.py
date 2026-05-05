@@ -13,7 +13,13 @@ from ltx_core.conditioning import (
 )
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
-from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
+from ltx_core.model.video_vae import (
+    SpatialTilingConfig,
+    TemporalTilingConfig,
+    TilingConfig,
+    VideoEncoder,
+    get_video_chunks_number,
+)
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import (
@@ -52,6 +58,11 @@ class ICLoraPipeline:
     by 2x and refines with additional denoising steps for higher quality output.
     Both stages use distilled models for efficiency.
     """
+
+    CONDITIONING_VIDEO_TILING = TilingConfig(
+        spatial_config=SpatialTilingConfig(tile_size_in_pixels=256, tile_overlap_in_pixels=64),
+        temporal_config=TemporalTilingConfig(tile_size_in_frames=24, tile_overlap_in_frames=16),
+    )
 
     def __init__(
         self,
@@ -185,6 +196,11 @@ class ICLoraPipeline:
             height=height // 2,
             fps=frame_rate,
         )
+        logging.info(
+            "[IC-LoRA] Stage 1 target pixel shape: "
+            f"(B={stage_1_output_shape.batch}, C=3, F={stage_1_output_shape.frames}, "
+            f"H={stage_1_output_shape.height}, W={stage_1_output_shape.width})"
+        )
 
         # Encode conditionings using the video encoder block
         stage_1_conditionings = self.image_conditioner(
@@ -219,19 +235,32 @@ class ICLoraPipeline:
             ),
             streaming_prefetch_count=streaming_prefetch_count,
         )
+        if video_state is not None:
+            logging.info(f"[IC-LoRA] Stage 1 output latent shape: {tuple(video_state.latent.shape)}")
 
         if skip_stage_2:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
+            if video_state is not None:
+                logging.info(
+                    "[IC-LoRA] Final decoded video will come from Stage 1 latent at half resolution: "
+                    f"{tuple(video_state.latent.shape)}"
+                )
             decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
             decoded_audio = self.audio_decoder(audio_state.latent)
             return decoded_video, decoded_audio
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
+        logging.info(f"[IC-LoRA] Stage 2 input latent shape: {tuple(upscaled_video_latent.shape)}")
 
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        logging.info(
+            "[IC-LoRA] Stage 2 target pixel shape: "
+            f"(B={stage_2_output_shape.batch}, C=3, F={stage_2_output_shape.frames}, "
+            f"H={stage_2_output_shape.height}, W={stage_2_output_shape.width})"
+        )
         stage_2_conditionings = self.image_conditioner(
             lambda enc: combined_image_conditionings(
                 images=images,
@@ -264,6 +293,8 @@ class ICLoraPipeline:
             ),
             streaming_prefetch_count=streaming_prefetch_count,
         )
+        if video_state is not None:
+            logging.info(f"[IC-LoRA] Stage 2 output latent shape: {tuple(video_state.latent.shape)}")
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
         decoded_audio = self.audio_decoder(audio_state.latent)
@@ -317,7 +348,13 @@ class ICLoraPipeline:
             # Load video at scaled-down resolution (if scale > 1)
             frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=self.device)
             video = video_preprocess(frame_gen, ref_height, ref_width, self.dtype, self.device)
-            encoded_video = video_encoder(video)
+            logging.info(f"[IC-LoRA] Conditioning video pixel tensor shape: {tuple(video.shape)}")
+            logging.info(
+                "[IC-LoRA] Encoding conditioning video with tiled VAE encode "
+                f"(ref size={ref_width}x{ref_height}, frames={video.shape[2]})"
+            )
+            encoded_video = video_encoder.tiled_encode(video, tiling_config=self.CONDITIONING_VIDEO_TILING)
+            logging.info(f"[IC-LoRA] Conditioning video latent shape: {tuple(encoded_video.shape)}")
             reference_video_shape = VideoLatentShape.from_torch_shape(encoded_video.shape)
 
             # Build attention_mask for ConditioningItemAttentionStrengthWrapper
