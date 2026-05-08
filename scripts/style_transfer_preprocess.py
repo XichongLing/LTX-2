@@ -9,15 +9,22 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 SEQUENCE_TO_VIDEO_SCRIPT = SCRIPTS_DIR / "sequence_to_video.py"
+PRECOMPUTE_DEPTH_VIDEO_SCRIPT = SCRIPTS_DIR / "precompute_depth_video.py"
 DEFAULT_FLUX_RUNNER = REPO_ROOT.parent / "flux.2_dev" / "run_flux_first_frame_style_transfer.py"
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 
 @dataclass(frozen=True)
@@ -215,33 +222,160 @@ def resolve_reference_image(args: argparse.Namespace, source_first_frame: Path, 
     return translated
 
 
-def _import_control_helpers():
-    from run_ic_lora_style_transfer import (
-        create_depth_video_from_rgb,
-        create_edge_video_from_rgb,
-        is_readable_video_file,
-        read_video_metadata,
-    )
-    from depth_control_adapter import create_gt_depth_control_video
+def read_video_metadata(video_path: str) -> tuple[int, int, int, float]:
+    import av
 
-    return (
-        create_depth_video_from_rgb,
-        create_edge_video_from_rgb,
-        create_gt_depth_control_video,
-        is_readable_video_file,
-        read_video_metadata,
-    )
+    path = Path(video_path).expanduser().resolve()
+    with av.open(str(path)) as container:
+        video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+        if video_stream is None:
+            raise ValueError(f"No video stream found in {path}")
+
+        width = int(video_stream.codec_context.width or video_stream.width)
+        height = int(video_stream.codec_context.height or video_stream.height)
+        fps_value = video_stream.average_rate or video_stream.base_rate or Fraction(25, 1)
+        fps = float(fps_value)
+
+        frames = video_stream.frames
+        if not frames or frames <= 0:
+            frames = 0
+            for packet in container.demux(video_stream):
+                for _frame in packet.decode():
+                    frames += 1
+
+    if frames <= 0:
+        raise ValueError(f"Could not determine frame count for {path}")
+    return width, height, frames, fps
+
+
+def is_readable_video_file(path: Path) -> bool:
+    import av
+
+    if not path.is_file() or path.stat().st_size <= 0:
+        return False
+
+    try:
+        with av.open(str(path)) as container:
+            return any(stream.type == "video" for stream in container.streams)
+    except Exception:
+        return False
+
+
+def create_depth_video_from_rgb(
+    rgb_video_path: str,
+    output_path: str,
+    depth_model_name_or_path: str | None,
+    cache_dir: str | None = None,
+    depth_backend: str = "auto",
+    depth_device: str = "cuda",
+    depth_use_fast: bool = False,
+    video_depth_anything_root: str | None = None,
+    video_depth_anything_python: str | None = None,
+    video_depth_anything_encoder: str = "vitl",
+    video_depth_anything_metric: bool = False,
+    video_depth_anything_input_size: int | None = None,
+    video_depth_anything_max_res: int | None = None,
+    video_depth_anything_max_len: int | None = None,
+    video_depth_anything_target_fps: int | None = None,
+    video_depth_anything_fp32: bool = False,
+) -> None:
+    if not PRECOMPUTE_DEPTH_VIDEO_SCRIPT.is_file():
+        raise FileNotFoundError(f"Depth precompute script not found: {PRECOMPUTE_DEPTH_VIDEO_SCRIPT}")
+
+    command = [
+        sys.executable,
+        str(PRECOMPUTE_DEPTH_VIDEO_SCRIPT),
+        "--input",
+        str(Path(rgb_video_path).expanduser().resolve()),
+        "--output",
+        str(Path(output_path).expanduser().resolve()),
+        "--depth-backend",
+        depth_backend,
+        "--device",
+        depth_device,
+    ]
+    if depth_model_name_or_path:
+        command.extend(["--depth-model", depth_model_name_or_path])
+    if cache_dir:
+        command.extend(["--cache-dir", cache_dir])
+    if depth_use_fast:
+        command.append("--use-fast")
+    if video_depth_anything_root:
+        command.extend(["--video-depth-anything-root", video_depth_anything_root])
+    if video_depth_anything_python:
+        command.extend(["--video-depth-anything-python", video_depth_anything_python])
+    if video_depth_anything_encoder != "vitl":
+        command.extend(["--video-depth-anything-encoder", video_depth_anything_encoder])
+    if video_depth_anything_metric:
+        command.append("--video-depth-anything-metric")
+    if video_depth_anything_input_size is not None:
+        command.extend(["--video-depth-anything-input-size", str(video_depth_anything_input_size)])
+    if video_depth_anything_max_res is not None:
+        command.extend(["--video-depth-anything-max-res", str(video_depth_anything_max_res)])
+    if video_depth_anything_max_len is not None:
+        command.extend(["--video-depth-anything-max-len", str(video_depth_anything_max_len)])
+    if video_depth_anything_target_fps is not None:
+        command.extend(["--video-depth-anything-target-fps", str(video_depth_anything_target_fps)])
+    if video_depth_anything_fp32:
+        command.append("--video-depth-anything-fp32")
+
+    subprocess.run(command, check=True)
+
+
+def _predict_edge_frame(frame_rgb, low_threshold: int, high_threshold: int):
+    import numpy as np
+
+    if cv2 is None:
+        raise RuntimeError("Edge conditioning requested, but opencv-python/cv2 is not installed.")
+
+    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, threshold1=low_threshold, threshold2=high_threshold)
+    return np.repeat(edges[:, :, None], 3, axis=2)
+
+
+def create_edge_video_from_rgb(
+    rgb_video_path: str,
+    output_path: str,
+    low_threshold: int = 100,
+    high_threshold: int = 200,
+) -> None:
+    import av
+
+    if low_threshold < 0 or high_threshold < 0:
+        raise ValueError("Canny thresholds must be non-negative.")
+    if high_threshold < low_threshold:
+        raise ValueError("--edge-high-threshold must be greater than or equal to --edge-low-threshold.")
+
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    with av.open(rgb_video_path) as input_container, av.open(str(output), mode="w") as output_container:
+        input_stream = next((stream for stream in input_container.streams if stream.type == "video"), None)
+        if input_stream is None:
+            raise ValueError(f"No video stream found in {rgb_video_path}")
+
+        fps_value = input_stream.average_rate or input_stream.base_rate or Fraction(25, 1)
+        fps = float(fps_value)
+        width = int(input_stream.codec_context.width or input_stream.width)
+        height = int(input_stream.codec_context.height or input_stream.height)
+
+        output_stream = output_container.add_stream("libx264", rate=max(1, int(round(fps))))
+        output_stream.width = width
+        output_stream.height = height
+        output_stream.pix_fmt = "yuv420p"
+
+        for frame in input_container.decode(video=0):
+            rgb_frame = frame.to_ndarray(format="rgb24")
+            edge_rgb = _predict_edge_frame(rgb_frame, low_threshold, high_threshold)
+            out_frame = av.VideoFrame.from_ndarray(edge_rgb, format="rgb24")
+            for packet in output_stream.encode(out_frame):
+                output_container.mux(packet)
+
+        for packet in output_stream.encode():
+            output_container.mux(packet)
 
 
 def resolve_control_video(args: argparse.Namespace, source_video: Path, input_path: Path, work_dir: Path) -> Path:
-    (
-        create_depth_video_from_rgb,
-        create_edge_video_from_rgb,
-        create_gt_depth_control_video,
-        is_readable_video_file,
-        read_video_metadata,
-    ) = _import_control_helpers()
-
     controls_dir = work_dir / "controls"
     controls_dir.mkdir(parents=True, exist_ok=True)
 
@@ -274,6 +408,8 @@ def resolve_control_video(args: argparse.Namespace, source_video: Path, input_pa
         if is_readable_video_file(control_video):
             print(f"Reusing existing GT-depth control video: {control_video}")
             return control_video
+
+        from depth_control_adapter import create_gt_depth_control_video
 
         _width, _height, frame_count, fps = read_video_metadata(str(source_video))
         create_gt_depth_control_video(
