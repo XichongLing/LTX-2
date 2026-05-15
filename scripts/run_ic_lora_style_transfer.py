@@ -28,6 +28,30 @@ from ltx_pipelines.utils.args import ImageConditioningInput, QuantizationAction,
 from ltx_pipelines.utils.media_io import encode_video
 
 
+class ImageConditioningAction(argparse.Action):
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: list[str],
+        option_string: str | None = None,
+    ) -> None:
+        if len(values) not in (3, 4):
+            raise argparse.ArgumentError(
+                self,
+                f"{option_string} requires PATH FRAME_IDX STRENGTH [CRF], got {len(values)} values",
+            )
+        conditioning = ImageConditioningInput(
+            path=str(Path(values[0]).expanduser().resolve()),
+            frame_idx=int(values[1]),
+            strength=float(values[2]),
+            crf=int(values[3]) if len(values) == 4 else 33,
+        )
+        current = getattr(namespace, self.dest) or []
+        current.append(conditioning)
+        setattr(namespace, self.dest, current)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -48,7 +72,22 @@ def parse_args() -> argparse.Namespace:
             "style_transfer_preprocess.py or translate_single_sequence.py."
         ),
     )
-    parser.add_argument("--reference-image", required=True, help="Reference image whose style/appearance should influence the output.")
+    parser.add_argument(
+        "--reference-image",
+        required=True,
+        help="Reference image whose style/appearance should influence the output.",
+    )
+    parser.add_argument(
+        "--image-condition",
+        action=ImageConditioningAction,
+        nargs="+",
+        default=None,
+        metavar="IMAGE_CONDITION",
+        help=(
+            "Additional/replacement image conditioning. Can be repeated. "
+            "When omitted, --reference-image/--image-frame-idx/--image-strength/--image-crf are used."
+        ),
+    )
     parser.add_argument("--output", required=True, help="Output MP4 path.")
     parser.add_argument(
         "--prompt",
@@ -193,6 +232,21 @@ def validate_conditioning_video_path(args: argparse.Namespace) -> str:
     return str(conditioning_path)
 
 
+def resolve_image_conditionings(args: argparse.Namespace, num_frames: int) -> list[ImageConditioningInput]:
+    image_conditionings = args.image_condition or [
+        ImageConditioningInput(
+            path=str(Path(args.reference_image).expanduser().resolve()),
+            frame_idx=args.image_frame_idx,
+            strength=args.image_strength,
+            crf=args.image_crf,
+        )
+    ]
+    for conditioning in image_conditionings:
+        if conditioning.frame_idx < 0 or conditioning.frame_idx >= num_frames:
+            raise ValueError(f"image condition frame_idx must be in [0, {num_frames - 1}]: {conditioning}")
+    return image_conditionings
+
+
 def main() -> None:
     args = parse_args()
 
@@ -215,8 +269,7 @@ def main() -> None:
         raise ValueError("num_frames must be positive.")
     if not (0.0 <= args.conditioning_attention_strength <= 1.0):
         raise ValueError("conditioning_attention_strength must be between 0.0 and 1.0.")
-    if args.image_frame_idx < 0 or args.image_frame_idx >= num_frames:
-        raise ValueError(f"image-frame-idx must be in [0, {num_frames - 1}]")
+    image_conditionings = resolve_image_conditionings(args, num_frames)
 
     print(
         "Resolved video dimensions: "
@@ -251,14 +304,7 @@ def main() -> None:
         width=width,
         num_frames=num_frames,
         frame_rate=frame_rate,
-        images=[
-            ImageConditioningInput(
-                path=str(Path(args.reference_image).expanduser().resolve()),
-                frame_idx=args.image_frame_idx,
-                strength=args.image_strength,
-                crf=args.image_crf,
-            )
-        ],
+        images=image_conditionings,
         video_conditioning=[
             (
                 conditioning_video_path,
@@ -287,7 +333,7 @@ def main() -> None:
     print(
         "Generation settings: "
         f"{width}x{height}, {num_frames} frames at {frame_rate:.3f} fps, "
-        f"image strength={args.image_strength}, video strength={args.video_strength}, "
+        f"image conditions={len(image_conditionings)}, video strength={args.video_strength}, "
         f"conditioning mode={args.conditioning_mode}"
     )
 

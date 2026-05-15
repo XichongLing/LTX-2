@@ -32,6 +32,9 @@ class PreparedStyleTransferInputs:
     source_video: str
     source_first_frame: str
     reference_image: str
+    source_reference_frames: list[str]
+    reference_images: list[str]
+    reference_frame_indices: list[int]
     control_video: str
     work_dir: str
 
@@ -87,14 +90,17 @@ def run_command(command: list[str]) -> None:
     subprocess.run(command, check=True)
 
 
-def extract_first_frame_from_video(video_path: Path, output_path: Path) -> Path:
+def extract_frame_from_video(video_path: Path, frame_idx: int, output_path: Path) -> Path:
     import av
     import numpy as np
     from PIL import Image
 
+    if frame_idx < 0:
+        raise ValueError(f"reference frame index must be non-negative, got {frame_idx}")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.is_file():
-        print(f"Reusing existing source first frame: {output_path}")
+        print(f"Reusing existing source reference frame: {output_path}")
         return output_path
 
     with av.open(str(video_path)) as container:
@@ -102,13 +108,21 @@ def extract_first_frame_from_video(video_path: Path, output_path: Path) -> Path:
         if video_stream is None:
             raise ValueError(f"No video stream found in {video_path}")
 
+        current_idx = 0
         for packet in container.demux(video_stream):
             for frame in packet.decode():
+                if current_idx != frame_idx:
+                    current_idx += 1
+                    continue
                 array = frame.to_ndarray(format="rgb24")
                 Image.fromarray(np.asarray(array, dtype=np.uint8)).save(output_path)
                 return output_path
 
-    raise ValueError(f"Could not decode a frame from {video_path}")
+    raise ValueError(f"Could not decode frame {frame_idx} from {video_path}")
+
+
+def extract_first_frame_from_video(video_path: Path, output_path: Path) -> Path:
+    return extract_frame_from_video(video_path, 0, output_path)
 
 
 def build_source_video(args: argparse.Namespace, input_path: Path, work_dir: Path) -> Path:
@@ -148,18 +162,27 @@ def build_source_video(args: argparse.Namespace, input_path: Path, work_dir: Pat
     return output_path
 
 
-def resolve_reference_image(args: argparse.Namespace, source_first_frame: Path, work_dir: Path) -> Path:
+def _translated_reference_output_path(args: argparse.Namespace, work_dir: Path, frame_idx: int) -> Path:
+    output_name = Path(args.flux_output_name)
+    if frame_idx == 0:
+        return work_dir / output_name
+    return work_dir / output_name.parent / f"{output_name.stem}_{frame_idx:06d}{output_name.suffix}"
+
+
+def resolve_reference_image(args: argparse.Namespace, source_first_frame: Path, work_dir: Path, frame_idx: int = 0) -> Path:
     if args.translated_first_frame:
+        if frame_idx != 0:
+            raise ValueError("--translated-first-frame can only be used with --reference-frame-list 0")
         translated = Path(args.translated_first_frame).expanduser().resolve()
         if not translated.is_file():
             raise FileNotFoundError(f"translated-first-frame does not exist: {translated}")
         return translated
 
     if args.use_local_flux_runner:
-        translated = work_dir / args.flux_output_name
+        translated = _translated_reference_output_path(args, work_dir, frame_idx)
         translated.parent.mkdir(parents=True, exist_ok=True)
         if translated.is_file():
-            print(f"Reusing existing translated first frame: {translated}")
+            print(f"Reusing existing translated reference frame: {translated}")
             return translated
 
         runner_path = Path(args.flux_runner_path).expanduser().resolve()
@@ -202,10 +225,10 @@ def resolve_reference_image(args: argparse.Namespace, source_first_frame: Path, 
             "so preprocessing can create a reference image."
         )
 
-    translated = work_dir / args.flux_output_name
+    translated = _translated_reference_output_path(args, work_dir, frame_idx)
     translated.parent.mkdir(parents=True, exist_ok=True)
     if translated.is_file():
-        print(f"Reusing existing translated first frame: {translated}")
+        print(f"Reusing existing translated reference frame: {translated}")
         return translated
 
     command = args.flux_command_template.format(
@@ -220,6 +243,15 @@ def resolve_reference_image(args: argparse.Namespace, source_first_frame: Path, 
     if not translated.is_file():
         raise FileNotFoundError(f"The FLUX command did not create {translated}")
     return translated
+
+
+def normalize_reference_frame_indices(indices: list[int]) -> list[int]:
+    if not indices:
+        return [0]
+    normalized = sorted(set(indices))
+    if normalized[0] != 0:
+        raise ValueError("--reference-frame-list must include 0 so the sequence has a first-frame condition")
+    return normalized
 
 
 def read_video_metadata(video_path: str) -> tuple[int, int, int, float]:
@@ -374,8 +406,8 @@ def create_edge_video_from_rgb(
         for packet in output_stream.encode():
             output_container.mux(packet)
 
-
 def resolve_control_video(args: argparse.Namespace, source_video: Path, input_path: Path, work_dir: Path) -> Path:
+
     controls_dir = work_dir / "controls"
     controls_dir.mkdir(parents=True, exist_ok=True)
 
@@ -389,41 +421,66 @@ def resolve_control_video(args: argparse.Namespace, source_video: Path, input_pa
     if args.conditioning_mode == "rgb":
         return source_video
 
-    if args.accept_gt_depths:
-        if args.conditioning_mode != "depth":
-            raise ValueError("--accept-gt-depths requires --conditioning-mode depth")
-        missing = [
-            name
-            for name, value in (
-                ("--gt-depth-dir", args.gt_depth_dir),
-                ("--gt-depth-source-root", args.gt_depth_source_root),
-                ("--gt-depth-source-path", args.gt_depth_source_path),
+    elif args.conditioning_mode == "depth":
+        if args.accept_gt_depths:
+            args.gt_depth_source_path = args.gt_depth_source_path or str(input_path)
+            missing = [
+                name
+                for name, value in (
+                    ("--gt-depth-dir", args.gt_depth_dir),
+                    ("--gt-depth-source-root", args.gt_depth_source_root),
+                    ("--gt-depth-source-path", args.gt_depth_source_path),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError("--accept-gt-depths requires " + ", ".join(missing))
+
+            control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "gt_depth.mp4"
+            if is_readable_video_file(control_video):
+                print(f"Reusing existing GT-depth control video: {control_video}")
+                return control_video
+
+            from depth_control_adapter import create_gt_depth_control_video
+
+            _width, _height, frame_count, fps = read_video_metadata(str(source_video))
+            create_gt_depth_control_video(
+                dataset=args.gt_depth_dataset or args.dataset,
+                gt_depth_root=args.gt_depth_dir,
+                source_root=args.gt_depth_source_root,
+                source_path=args.gt_depth_source_path or str(input_path),
+                output_path=str(control_video),
+                fps=fps,
+                frame_cap=frame_count,
             )
-            if not value
-        ]
-        if missing:
-            raise ValueError("--accept-gt-depths requires " + ", ".join(missing))
-
-        control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "gt_depth.mp4"
-        if is_readable_video_file(control_video):
-            print(f"Reusing existing GT-depth control video: {control_video}")
             return control_video
+        
+        else:
+            if args.depth_backend != "video-depth-anything" and not args.depth_model:
+                raise ValueError(
+                    "conditioning-mode=depth requires --depth-model unless --depth-backend video-depth-anything is used."
+                )
 
-        from depth_control_adapter import create_gt_depth_control_video
-
-        _width, _height, frame_count, fps = read_video_metadata(str(source_video))
-        create_gt_depth_control_video(
-            dataset=args.gt_depth_dataset or args.dataset,
-            gt_depth_root=args.gt_depth_dir,
-            source_root=args.gt_depth_source_root,
-            source_path=args.gt_depth_source_path or str(input_path),
-            output_path=str(control_video),
-            fps=fps,
-            frame_cap=frame_count,
-        )
-        return control_video
-
-    if args.conditioning_mode == "edge":
+            create_depth_video_from_rgb(
+                rgb_video_path=str(source_video),
+                output_path=str(control_video),
+                depth_model_name_or_path=args.depth_model,
+                cache_dir=args.depth_cache_dir,
+                depth_backend=args.depth_backend,
+                depth_device=args.depth_device,
+                depth_use_fast=args.depth_use_fast,
+                video_depth_anything_root=args.video_depth_anything_root,
+                video_depth_anything_python=args.video_depth_anything_python,
+                video_depth_anything_encoder=args.video_depth_anything_encoder,
+                video_depth_anything_metric=args.video_depth_anything_metric,
+                video_depth_anything_input_size=args.video_depth_anything_input_size,
+                video_depth_anything_max_res=args.video_depth_anything_max_res,
+                video_depth_anything_max_len=args.video_depth_anything_max_len,
+                video_depth_anything_target_fps=args.video_depth_anything_target_fps,
+                video_depth_anything_fp32=args.video_depth_anything_fp32,
+            )
+            return control_video
+    elif args.conditioning_mode == "edge":
         control_video = Path(args.edge_output).expanduser().resolve() if args.edge_output else controls_dir / "edge.mp4"
         if is_readable_video_file(control_video):
             print(f"Reusing existing edge control video: {control_video}")
@@ -435,58 +492,55 @@ def resolve_control_video(args: argparse.Namespace, source_video: Path, input_pa
             high_threshold=args.edge_high_threshold,
         )
         return control_video
-
-    if args.conditioning_mode != "depth":
+    else:
         raise ValueError(f"Unsupported conditioning mode: {args.conditioning_mode}")
 
-    if args.depth_backend != "video-depth-anything" and not args.depth_model:
-        raise ValueError(
-            "conditioning-mode=depth requires --depth-model unless --depth-backend video-depth-anything is used."
-        )
-
-    control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "depth.mp4"
-    if is_readable_video_file(control_video):
-        print(f"Reusing existing depth control video: {control_video}")
-        return control_video
-
-    create_depth_video_from_rgb(
-        rgb_video_path=str(source_video),
-        output_path=str(control_video),
-        depth_model_name_or_path=args.depth_model,
-        cache_dir=args.depth_cache_dir,
-        depth_backend=args.depth_backend,
-        depth_device=args.depth_device,
-        depth_use_fast=args.depth_use_fast,
-        video_depth_anything_root=args.video_depth_anything_root,
-        video_depth_anything_python=args.video_depth_anything_python,
-        video_depth_anything_encoder=args.video_depth_anything_encoder,
-        video_depth_anything_metric=args.video_depth_anything_metric,
-        video_depth_anything_input_size=args.video_depth_anything_input_size,
-        video_depth_anything_max_res=args.video_depth_anything_max_res,
-        video_depth_anything_max_len=args.video_depth_anything_max_len,
-        video_depth_anything_target_fps=args.video_depth_anything_target_fps,
-        video_depth_anything_fp32=args.video_depth_anything_fp32,
-    )
     return control_video
 
+def resolve_source_frames(args: argparse.Namespace, source_video: Path, work_dir: Path) -> list[Path]:
+    _width, _height, frame_count, _fps = read_video_metadata(str(source_video))
+    reference_frame_indices = normalize_reference_frame_indices(args.reference_frame_list)
+    out_of_range = [idx for idx in reference_frame_indices if idx >= frame_count]
+    if out_of_range:
+        raise ValueError(f"reference frame index out of range for {frame_count} frames: {out_of_range}")
+    source_reference_frames = [
+        extract_frame_from_video(
+            source_video,
+            frame_idx,
+            work_dir / "source_first_frame.png"
+            if frame_idx == 0
+            else work_dir / "reference_frames" / f"source_{frame_idx:06d}.png",
+        )
+        for frame_idx in reference_frame_indices
+    ]
+    return reference_frame_indices, source_reference_frames
 
 def prepare_style_transfer_inputs(args: argparse.Namespace) -> PreparedStyleTransferInputs:
     input_path = Path(args.input_path).expanduser().resolve()
     work_dir = Path(args.work_dir).expanduser().resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.accept_gt_depths:
-        args.gt_depth_source_path = args.gt_depth_source_path or str(input_path)
-
+    # collect source video and source reference frames
     source_video = build_source_video(args, input_path, work_dir)
-    source_first_frame = extract_first_frame_from_video(source_video, work_dir / "source_first_frame.png")
-    reference_image = resolve_reference_image(args, source_first_frame, work_dir)
+    reference_frame_indices, source_reference_frames = resolve_source_frames(args, source_video, work_dir)
+    source_first_frame = source_reference_frames[0]
+
+    # prepare edited reference images by running FLUX on the source reference frames
+    reference_images = [
+        resolve_reference_image(args, source_frame, work_dir, frame_idx)
+        for source_frame, frame_idx in zip(source_reference_frames, reference_frame_indices, strict=True)
+    ]
+    reference_first_frame = reference_images[0]
+    
     control_video = resolve_control_video(args, source_video, input_path, work_dir)
 
     return PreparedStyleTransferInputs(
         source_video=str(source_video),
         source_first_frame=str(source_first_frame),
-        reference_image=str(reference_image),
+        reference_image=str(reference_first_frame),
+        source_reference_frames=[str(path) for path in source_reference_frames],
+        reference_images=[str(path) for path in reference_images],
+        reference_frame_indices=reference_frame_indices,
         control_video=str(control_video),
         work_dir=str(work_dir),
     )
@@ -499,6 +553,13 @@ def add_preprocess_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--work-dir", required=True, help="Directory for intermediate preprocessing artifacts.")
     parser.add_argument("--reference-video-fps", type=float, default=24.0)
     parser.add_argument("--reference-video-crf", type=int, default=18)
+    parser.add_argument(
+        "--reference-frame-list",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Global frame indices to edit and use as reference conditions. Defaults to 0.",
+    )
     parser.add_argument("--prompt", default="")
     parser.add_argument("--negative-prompt", default="")
 

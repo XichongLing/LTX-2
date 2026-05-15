@@ -32,6 +32,9 @@ def build_style_transfer_command(
     source_video: str,
     control_video: str,
     reference_image: str,
+    image_conditions: list[tuple[str, int]] | None = None,
+    num_frames: int | None = None,
+    output: str | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -51,7 +54,7 @@ def build_style_transfer_command(
         "--reference-image",
         reference_image,
         "--output",
-        args.output,
+        output or args.output,
         "--prompt",
         args.prompt,
         "--negative-prompt",
@@ -76,8 +79,9 @@ def build_style_transfer_command(
         command.extend(["--width", str(args.width)])
     if args.height is not None:
         command.extend(["--height", str(args.height)])
-    if args.num_frames is not None:
-        command.extend(["--num-frames", str(args.num_frames)])
+    resolved_num_frames = num_frames if num_frames is not None else args.num_frames
+    if resolved_num_frames is not None:
+        command.extend(["--num-frames", str(resolved_num_frames)])
     if args.frame_rate is not None:
         command.extend(["--frame-rate", str(args.frame_rate)])
     if args.skip_stage_2:
@@ -90,6 +94,18 @@ def build_style_transfer_command(
         command.extend(["--streaming-prefetch-count", str(args.streaming_prefetch_count)])
     if args.quantization:
         command.extend(["--quantization", *args.quantization])
+
+    if image_conditions:
+        for image_path, frame_idx in image_conditions:
+            command.extend(
+                [
+                    "--image-condition",
+                    image_path,
+                    str(frame_idx),
+                    str(args.image_strength),
+                    str(args.image_crf),
+                ]
+            )
 
     return command
 
@@ -138,13 +154,21 @@ def main() -> None:
     if args.print_prepared_inputs:
         print(f"Prepared inputs: {asdict(prepared)}")
 
-    command = build_style_transfer_command(args, prepared.source_video, prepared.control_video, prepared.reference_image)
+    image_conditions = list(zip(prepared.reference_images, prepared.reference_frame_indices, strict=True))
+    command = build_style_transfer_command(
+        args,
+        prepared.source_video,
+        prepared.control_video,
+        prepared.reference_image,
+        image_conditions=image_conditions,
+    )
     run_command(command)
 
     print("Single-sequence translation completed successfully.")
     print(f"Source video: {prepared.source_video}")
     print(f"Source first frame: {prepared.source_first_frame}")
-    print(f"Reference image: {prepared.reference_image}")
+    print(f"Reference images: {prepared.reference_images}")
+    print(f"Reference frame indices: {prepared.reference_frame_indices}")
     print(f"Control video: {prepared.control_video}")
     print(f"Final output: {output_path}")
 

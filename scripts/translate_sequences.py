@@ -13,6 +13,7 @@ from style_transfer_preprocess import VIDEO_SUFFIXES, natural_key
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRANSLATE_SINGLE_SEQUENCE_SCRIPT = REPO_ROOT / "scripts" / "translate_single_sequence.py"
+TRANSLATE_SINGLE_SEQUENCE_CHUNKED_SCRIPT = REPO_ROOT / "scripts" / "translate_single_sequence_chunked.py"
 
 
 def input_mode_for_dataset(dataset: str) -> str:
@@ -70,6 +71,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--chunk-mode",
+        action="store_true",
+        help="Use translate_single_sequence_chunked.py; reference-frame-list defines chunk starts.",
+    )
     parser.add_argument("--accept-gt-depths", action="store_true")
     parser.add_argument("--gt-depth-dir", default=None)
     return parser.parse_known_args()
@@ -101,9 +107,10 @@ def main() -> None:
             print(f"Skipping existing output: {output_path}")
             continue
 
+        single_sequence_script = TRANSLATE_SINGLE_SEQUENCE_CHUNKED_SCRIPT if args.chunk_mode else TRANSLATE_SINGLE_SEQUENCE_SCRIPT
         command = [
             args.ltx_python,
-            str(TRANSLATE_SINGLE_SEQUENCE_SCRIPT),
+            str(single_sequence_script),
             "--dataset",
             args.dataset,
             "--input-path",
