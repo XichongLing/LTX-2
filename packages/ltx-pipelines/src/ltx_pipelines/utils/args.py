@@ -226,6 +226,31 @@ def resolve_existing_path(path: str) -> str:
 QUANTIZATION_POLICIES = tuple(k.value for k in QuantizationKind)
 
 
+class QuantizationAction(argparse.Action):
+    """Parse ``--quantization POLICY [AMAX_PATH]`` into a string policy name.
+    Resolution to a :class:`QuantizationPolicy` is deferred to
+    :class:`_PipelineArgumentParser` which calls :func:`_resolve_quantization`
+    after all args are parsed (so the checkpoint path is available).
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,  # noqa: ARG002
+        namespace: argparse.Namespace,
+        values: list[str],
+        option_string: str | None = None,  # noqa: ARG002
+    ) -> None:
+        if not values:
+            raise argparse.ArgumentError(self, "at least one value required")
+        policy_name = values[0]
+        if policy_name not in QUANTIZATION_POLICIES:
+            raise argparse.ArgumentError(
+                self,
+                f"invalid quantization policy {policy_name!r}; choose from: {', '.join(QUANTIZATION_POLICIES)}",
+            )
+        setattr(namespace, self.dest, policy_name)
+
+
 def _resolve_quantization(namespace: argparse.Namespace) -> None:
     # Resolution is deferred until after parse_args because fp8-scaled-mm needs the
     # checkpoint path, which isn't on the namespace when the --quantization argument

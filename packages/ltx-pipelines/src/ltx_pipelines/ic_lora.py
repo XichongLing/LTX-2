@@ -35,7 +35,8 @@ from ltx_pipelines.utils.constants import (
     STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
-from ltx_pipelines.utils.denoisers import SimpleDenoiser
+from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
+from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
 from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
@@ -134,7 +135,11 @@ class ICLoraPipeline:
         conditioning_attention_mask: torch.Tensor | None = None,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-    ) -> tuple[Iterator[torch.Tensor], Audio]:
+        negative_prompt: str = "",
+        video_cfg_scale: float = 1.0,
+        audio_cfg_scale: float = 1.0,
+        generate_audio: bool = True,
+    ) -> tuple[Iterator[torch.Tensor], Audio | None]:
         """
         Generate video with IC-LoRA conditioning.
         Args:
@@ -176,13 +181,18 @@ class ICLoraPipeline:
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
 
-        (ctx_p,) = self.prompt_encoder(
-            [prompt],
+        use_cfg = not (abs(video_cfg_scale - 1.0) < 1e-6 and abs(audio_cfg_scale - 1.0) < 1e-6)
+        encode_prompts = [prompt, negative_prompt] if use_cfg else [prompt]
+        ctx_p, *rest = self.prompt_encoder(
+            encode_prompts,
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
         )
+        ctx_n = rest[0] if rest else None
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        video_context_n = ctx_n.video_encoding if ctx_n is not None else None
+        audio_context_n = ctx_n.audio_encoding if ctx_n is not None else None
 
         # Stage 1: Initial low resolution video generation.
         stage_1_output_shape = VideoPixelShape(
@@ -209,8 +219,24 @@ class ICLoraPipeline:
 
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
+        if use_cfg:
+            stage_1_denoiser = GuidedDenoiser(
+                v_context=video_context,
+                a_context=audio_context,
+                video_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(cfg_scale=video_cfg_scale, stg_scale=0.0, modality_scale=1.0),
+                    negative_context=video_context_n,
+                ),
+                audio_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(cfg_scale=audio_cfg_scale, stg_scale=0.0, modality_scale=1.0),
+                    negative_context=audio_context_n,
+                ),
+            )
+        else:
+            stage_1_denoiser = SimpleDenoiser(video_context, audio_context)
+
         video_state, audio_state = self.stage_1(
-            denoiser=SimpleDenoiser(video_context, audio_context),
+            denoiser=stage_1_denoiser,
             sigmas=stage_1_sigmas,
             noiser=noiser,
             width=stage_1_output_shape.width,
@@ -223,6 +249,8 @@ class ICLoraPipeline:
             ),
             audio=ModalitySpec(
                 context=audio_context,
+                frozen=not generate_audio,
+                noise_scale=0.0 if not generate_audio else 1.0,
             ),
         )
 
@@ -230,7 +258,7 @@ class ICLoraPipeline:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
             decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
-            decoded_audio = self.audio_decoder(audio_state.latent)
+            decoded_audio = self.audio_decoder(audio_state.latent) if generate_audio else None
             return decoded_video, decoded_audio
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
@@ -265,13 +293,14 @@ class ICLoraPipeline:
             ),
             audio=ModalitySpec(
                 context=audio_context,
-                noise_scale=stage_2_sigmas[0].item(),
+                noise_scale=stage_2_sigmas[0].item() if generate_audio else 0.0,
                 initial_latent=audio_state.latent,
+                frozen=not generate_audio,
             ),
         )
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
-        decoded_audio = self.audio_decoder(audio_state.latent)
+        decoded_audio = self.audio_decoder(audio_state.latent) if generate_audio else None
         return decoded_video, decoded_audio
 
     def _create_conditionings(
