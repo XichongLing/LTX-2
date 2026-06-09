@@ -8,7 +8,6 @@ from pathlib import Path
 
 import av
 import numpy as np
-import OpenImageIO
 import torch
 from einops import rearrange
 from PIL import Image
@@ -20,6 +19,11 @@ from ltx_core.types import Audio, VideoPixelShape
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 
 logger = logging.getLogger(__name__)
+
+try:
+    import OpenImageIO
+except ImportError:
+    OpenImageIO = None
 
 
 class ResizeMode(enum.Enum):
@@ -613,6 +617,9 @@ def save_exr_tensor(tensor: torch.Tensor, file_path: str | Path, half: bool = Fa
         file_path: Output path (e.g. ``frame_0000.exr``).
         half: Force float16 output with ZIP compression.
     """
+    if OpenImageIO is None:
+        raise RuntimeError("EXR output requires OpenImageIO. Install it to use save_exr_tensor().")
+
     if tensor.dim() == 3 and tensor.shape[0] == 3:
         tensor = tensor.permute(1, 2, 0)
     use_half = half or tensor.dtype in (torch.float16, torch.half)

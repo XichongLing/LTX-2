@@ -5,6 +5,7 @@ import torch
 from einops import rearrange
 from safetensors import safe_open
 
+from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import (
     ConditioningItem,
@@ -42,7 +43,7 @@ from ltx_pipelines.utils.constants import (
     STAGE_2_DISTILLED_SIGMAS,
     detect_params,
 )
-from ltx_pipelines.utils.denoisers import SimpleDenoiser
+from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
 from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
@@ -139,18 +140,26 @@ class ICLoraPipeline:
         frame_rate: float,
         images: list[ImageConditioningInput],
         video_conditioning: list[tuple[str, float]],
+        negative_prompt: str = "",
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
+        video_cfg_scale: float = 1.0,
+        audio_cfg_scale: float = 1.0,
+        max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
+        attention_probe: object | None = None,
+        reference_image_replace: set[int] | None = None,
+        first_frame_attention_multiplier: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
         Args:
             prompt: Text prompt for video generation.
+            negative_prompt: Negative prompt used by CFG when cfg scale is > 1.
             seed: Random seed for reproducibility.
             height: Output video height in pixels (must be divisible by 64).
             width: Output video width in pixels (must be divisible by 64).
@@ -176,6 +185,15 @@ class ICLoraPipeline:
                 conditioning_attention_strength.
                 When None (default): scalar conditioning_attention_strength is used
                 directly.
+            video_cfg_scale: CFG scale for video generation. 1.0 disables CFG.
+            audio_cfg_scale: CFG scale for audio generation. 1.0 disables CFG.
+            max_batch_size: Maximum batch size used inside guided denoising.
+            reference_image_replace: Optional set of pixel-frame indices whose image
+                conditionings should replace target latent frames in place. When None,
+                preserves the historical default of replacing frame 0 only.
+            first_frame_attention_multiplier: Attention multiplier for future target
+                tokens attending to in-place frame-0 replacement tokens. 1.0 preserves
+                current behavior; values >1.0 add positive attention-logit bias.
         Returns:
             Tuple of (video_iterator, audio_tensor).
         """
@@ -184,17 +202,29 @@ class ICLoraPipeline:
             raise ValueError(
                 f"conditioning_attention_strength must be in [0.0, 1.0], got {conditioning_attention_strength}"
             )
+        if first_frame_attention_multiplier <= 0.0:
+            raise ValueError(
+                "first_frame_attention_multiplier must be > 0.0, "
+                f"got {first_frame_attention_multiplier}"
+            )
+        if video_cfg_scale < 1.0:
+            raise ValueError(f"video_cfg_scale must be >= 1.0, got {video_cfg_scale}")
+        if audio_cfg_scale < 1.0:
+            raise ValueError(f"audio_cfg_scale must be >= 1.0, got {audio_cfg_scale}")
+        if max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be positive, got {max_batch_size}")
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
 
-        (ctx_p,) = self.prompt_encoder(
-            [prompt],
+        ctx_p, ctx_n = self.prompt_encoder(
+            [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+        video_negative_context, audio_negative_context = ctx_n.video_encoding, ctx_n.audio_encoding
 
         # Stage 1: Initial low resolution video generation.
         stage_1_output_shape = VideoPixelShape(
@@ -221,13 +251,26 @@ class ICLoraPipeline:
                 num_frames=num_frames,
                 conditioning_attention_strength=conditioning_attention_strength,
                 conditioning_attention_mask=conditioning_attention_mask,
+                reference_image_replace=reference_image_replace,
+                first_frame_attention_multiplier=first_frame_attention_multiplier,
             )
         )
 
         stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
         video_state, audio_state = self.stage_1(
-            denoiser=SimpleDenoiser(video_context, audio_context),
+            denoiser=GuidedDenoiser(
+                v_context=video_context,
+                a_context=audio_context,
+                video_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(cfg_scale=video_cfg_scale),
+                    negative_context=video_negative_context,
+                ),
+                audio_guider=MultiModalGuider(
+                    params=MultiModalGuiderParams(cfg_scale=audio_cfg_scale),
+                    negative_context=audio_negative_context,
+                ),
+            ),
             sigmas=stage_1_sigmas,
             noiser=noiser,
             width=stage_1_output_shape.width,
@@ -241,6 +284,16 @@ class ICLoraPipeline:
             audio=ModalitySpec(
                 context=audio_context,
             ),
+            loop=attention_probe.make_loop(
+                stage=1,
+                width=stage_1_output_shape.width,
+                height=stage_1_output_shape.height,
+                frames=stage_1_output_shape.frames,
+                fps=stage_1_output_shape.fps,
+            )
+            if attention_probe is not None
+            else None,
+            max_batch_size=max_batch_size,
         )
         if video_state is not None:
             logging.info(f"[IC-LoRA] Stage 1 output latent shape: {tuple(video_state.latent.shape)}")
@@ -276,6 +329,9 @@ class ICLoraPipeline:
                 video_encoder=enc,
                 dtype=self.dtype,
                 device=self.device,
+                reference_image_replace=reference_image_replace,
+                num_frames=num_frames,
+                first_frame_attention_multiplier=first_frame_attention_multiplier,
             )
         )
 
@@ -298,6 +354,15 @@ class ICLoraPipeline:
                 noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
+            loop=attention_probe.make_loop(
+                stage=2,
+                width=stage_2_output_shape.width,
+                height=stage_2_output_shape.height,
+                frames=stage_2_output_shape.frames,
+                fps=stage_2_output_shape.fps,
+            )
+            if attention_probe is not None
+            else None,
         )
         if video_state is not None:
             logging.info(f"[IC-LoRA] Stage 2 output latent shape: {tuple(video_state.latent.shape)}")
@@ -316,6 +381,8 @@ class ICLoraPipeline:
         video_encoder: VideoEncoder,
         conditioning_attention_strength: float = 1.0,
         conditioning_attention_mask: torch.Tensor | None = None,
+        reference_image_replace: set[int] | None = None,
+        first_frame_attention_multiplier: float = 1.0,
     ) -> list[ConditioningItem]:
         """
         Create conditioning items for video generation.
@@ -338,6 +405,9 @@ class ICLoraPipeline:
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
+            reference_image_replace=reference_image_replace,
+            num_frames=num_frames,
+            first_frame_attention_multiplier=first_frame_attention_multiplier,
         )
 
         # Calculate scaled dimensions for reference video conditioning.
@@ -482,6 +552,16 @@ def main() -> None:
             "(height//2, width//2). Useful for faster iteration or when GPU memory is limited."
         ),
     )
+    parser.add_argument(
+        "--first-frame-attention-multiplier",
+        type=float,
+        default=1.0,
+        help=(
+            "Attention multiplier for future target tokens attending to in-place frame-0 "
+            "replacement tokens. 1.0 preserves current behavior; values >1.0 add "
+            "positive attention-logit bias."
+        ),
+    )
     args = parser.parse_args()
 
     # Load mask video if provided via --conditioning-attention-mask
@@ -521,6 +601,7 @@ def main() -> None:
         conditioning_attention_strength=conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
+        first_frame_attention_multiplier=args.first_frame_attention_multiplier,
     )
 
     encode_video(
