@@ -5,7 +5,11 @@ import torch
 
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.conditioning import ConditioningItem
+from ltx_core.conditioning import (
+    ConditioningItem,
+    ConditioningItemAttentionStrengthWrapper,
+    VideoConditionByReferenceLatent,
+)
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.video_vae import (
@@ -15,8 +19,11 @@ from ltx_core.model.video_vae import (
     VideoEncoder,
     get_video_chunks_number,
 )
+from ltx_core.model.transformer.compiling import (
+    CompilationConfig,
+)
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoPixelShape
+from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
 from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
@@ -249,7 +256,7 @@ class ICLoraPipeline:
                 num_frames=num_frames,
                 conditioning_attention_strength=conditioning_attention_strength,
                 conditioning_attention_mask=conditioning_attention_mask,
-                reference_image_replace=reference_image_replace,
+                # reference_image_replace=reference_image_replace,
                 first_frame_attention_multiplier=first_frame_attention_multiplier,
             )
         )
@@ -327,9 +334,9 @@ class ICLoraPipeline:
                 video_encoder=enc,
                 dtype=self.dtype,
                 device=self.device,
-                reference_image_replace=reference_image_replace,
-                num_frames=num_frames,
-                first_frame_attention_multiplier=first_frame_attention_multiplier,
+                # reference_image_replace=reference_image_replace,
+                # num_frames=num_frames,
+                # first_frame_attention_multiplier=first_frame_attention_multiplier,
             )
         )
 
@@ -403,9 +410,9 @@ class ICLoraPipeline:
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
-            reference_image_replace=reference_image_replace,
-            num_frames=num_frames,
-            first_frame_attention_multiplier=first_frame_attention_multiplier,
+            # reference_image_replace=reference_image_replace,
+            # num_frames=num_frames,
+            # first_frame_attention_multiplier=first_frame_attention_multiplier,
         )
 
         # Calculate scaled dimensions for reference video conditioning.
