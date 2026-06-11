@@ -25,7 +25,12 @@ from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_M
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_pipelines import ICLoraPipeline
 from ltx_pipelines.utils.attention_probe import AttentionProbe, AttentionProbeConfig, parse_index_set
-from ltx_pipelines.utils.args import ImageConditioningInput, QuantizationAction, QUANTIZATION_POLICIES
+from ltx_pipelines.utils.args import (
+    ImageConditioningInput,
+    QuantizationAction,
+    QUANTIZATION_POLICIES,
+    _PipelineArgumentParser,
+)
 from ltx_pipelines.utils.media_io import encode_video
 
 
@@ -54,7 +59,7 @@ class ImageConditioningAction(argparse.Action):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = _PipelineArgumentParser(
         description=(
             "Run LTX-2 IC-LoRA style transfer: preserve the motion/camera/structure of a "
             "reference video while steering appearance toward a reference image."
