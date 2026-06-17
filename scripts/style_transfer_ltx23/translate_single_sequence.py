@@ -30,7 +30,7 @@ def run_command(command: list[str]) -> None:
 def build_style_transfer_command(
     args: argparse.Namespace,
     source_video: str,
-    control_video: str,
+    control_videos: list[str],
     reference_image: str,
     image_conditions: list[tuple[str, int]] | None = None,
     num_frames: int | None = None,
@@ -51,7 +51,7 @@ def build_style_transfer_command(
         "--reference-video",
         source_video,
         "--conditioning-video",
-        control_video,
+        control_videos[0],
         "--reference-image",
         reference_image,
         "--output",
@@ -75,6 +75,20 @@ def build_style_transfer_command(
         "--conditioning-attention-strength",
         str(args.conditioning_attention_strength),
     ]
+
+    if args.conditioning_mode in ("rgb+depth", "edge+depth+rgb") and len(control_videos) > 1:
+        command.extend(["--depth-conditioning-video", control_videos[1]])
+    if args.conditioning_mode == "edge+rgb" and len(control_videos) > 1:
+        command.extend(["--edge-conditioning-video", control_videos[1]])
+    if args.conditioning_mode == "edge+depth+rgb" and len(control_videos) > 2:
+        command.extend(["--edge-conditioning-video", control_videos[2]])
+
+    if getattr(args, "rgb_strength", None) is not None:
+        command.extend(["--rgb-strength", str(args.rgb_strength)])
+    if getattr(args, "depth_strength", None) is not None:
+        command.extend(["--depth-strength", str(args.depth_strength)])
+    if getattr(args, "edge_strength", None) is not None:
+        command.extend(["--edge-strength", str(args.edge_strength)])
 
     if args.width is not None:
         command.extend(["--width", str(args.width)])
@@ -157,6 +171,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--video-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--rgb-strength",
+        type=float,
+        default=None,
+        help="Strength for the RGB video condition in rgb+depth mode. Defaults to --video-strength.",
+    )
+    parser.add_argument(
+        "--depth-strength",
+        type=float,
+        default=None,
+        help="Strength for the depth condition in multi-signal modes. Defaults to --video-strength.",
+    )
+    parser.add_argument(
+        "--edge-strength",
+        type=float,
+        default=None,
+        help="Strength for the edge condition in multi-signal modes. Defaults to --video-strength.",
+    )
     parser.add_argument("--conditioning-attention-strength", type=float, default=1.0)
     parser.add_argument("--skip-stage-2", action="store_true")
     parser.add_argument("--enhance-prompt", action="store_true")
@@ -198,7 +230,7 @@ def main() -> None:
     command = build_style_transfer_command(
         args,
         prepared.source_video,
-        prepared.control_video,
+        prepared.control_videos,
         prepared.reference_image,
         image_conditions=image_conditions,
         reference_image_replace=args.reference_image_replace,
@@ -214,7 +246,7 @@ def main() -> None:
         "Reference image replace: "
         f"{args.reference_image_replace if args.reference_image_replace is not None else 'default(0)'}"
     )
-    print(f"Control video: {prepared.control_video}")
+    print(f"Control videos: {prepared.control_videos}")
     print(f"Final output: {output_path}")
 
 

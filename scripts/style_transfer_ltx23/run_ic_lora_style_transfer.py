@@ -142,9 +142,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-strength", type=float, default=1.0, help="Strength for the reference video IC-LoRA conditioning.")
     parser.add_argument(
         "--conditioning-mode",
-        choices=("rgb", "depth", "edge"),
+        choices=("rgb", "depth", "edge", "rgb+depth", "edge+rgb", "edge+depth+rgb"),
         default="rgb",
-        help="Interpretation of the conditioning video expected by the IC-LoRA.",
+        help=(
+            "Interpretation of the conditioning video(s) expected by the IC-LoRA. "
+            "Multi-signal modes: 'rgb+depth' (--conditioning-video + --depth-conditioning-video), "
+            "'edge+rgb' (--conditioning-video + --edge-conditioning-video), "
+            "'edge+depth+rgb' (all three)."
+        ),
+    )
+    parser.add_argument(
+        "--depth-conditioning-video",
+        default=None,
+        help="Depth conditioning video. Required for rgb+depth and edge+depth+rgb modes.",
+    )
+    parser.add_argument(
+        "--edge-conditioning-video",
+        default=None,
+        help="Edge conditioning video. Required for edge+rgb and edge+depth+rgb modes.",
+    )
+    parser.add_argument(
+        "--rgb-strength",
+        type=float,
+        default=None,
+        help="Strength for the RGB condition in multi-signal modes. Defaults to --video-strength.",
+    )
+    parser.add_argument(
+        "--depth-strength",
+        type=float,
+        default=None,
+        help="Strength for the depth condition in multi-signal modes. Defaults to --video-strength.",
+    )
+    parser.add_argument(
+        "--edge-strength",
+        type=float,
+        default=None,
+        help="Strength for the edge condition in multi-signal modes. Defaults to --video-strength.",
     )
     parser.add_argument(
         "--conditioning-attention-strength",
@@ -266,15 +299,48 @@ def is_readable_video_file(path: Path) -> bool:
         return False
 
 
-def validate_conditioning_video_path(args: argparse.Namespace) -> str:
-    conditioning_path = Path(args.conditioning_video).expanduser().resolve()
-    if not is_readable_video_file(conditioning_path):
-        raise ValueError(
-            f"conditioning video does not exist or is unreadable: {conditioning_path}. "
-            "Prepare it with style_transfer_preprocess.py or translate_single_sequence.py."
-        )
+def resolve_conditioning_videos(args: argparse.Namespace) -> list[tuple[str, float]]:
+    def _validated(label: str, path_str: str | None, flag: str) -> Path:
+        if not path_str:
+            raise ValueError(f"{flag} is required when --conditioning-mode {args.conditioning_mode} is used.")
+        p = Path(path_str).expanduser().resolve()
+        if not is_readable_video_file(p):
+            raise ValueError(
+                f"{label} conditioning video does not exist or is unreadable: {p}. "
+                "Prepare it with style_transfer_preprocess.py or translate_single_sequence.py."
+            )
+        return p
+
+    def _s(attr: str) -> float:
+        v = getattr(args, attr, None)
+        return v if v is not None else args.video_strength
+
+    mode = args.conditioning_mode
+
+    if mode in ("rgb+depth", "edge+rgb", "edge+depth+rgb"):
+        rgb_path = _validated("RGB", args.conditioning_video, "--conditioning-video")
+        rgb_str = _s("rgb_strength")
+        print(f"Using RGB conditioning video: {rgb_path} (strength={rgb_str})")
+        result = [(str(rgb_path), rgb_str)]
+
+        if mode in ("rgb+depth", "edge+depth+rgb"):
+            depth_path = _validated("depth", args.depth_conditioning_video, "--depth-conditioning-video")
+            depth_str = _s("depth_strength")
+            print(f"Using depth conditioning video: {depth_path} (strength={depth_str})")
+            result.append((str(depth_path), depth_str))
+
+        if mode in ("edge+rgb", "edge+depth+rgb"):
+            edge_path = _validated("edge", args.edge_conditioning_video, "--edge-conditioning-video")
+            edge_str = _s("edge_strength")
+            print(f"Using edge conditioning video: {edge_path} (strength={edge_str})")
+            result.append((str(edge_path), edge_str))
+
+        return result
+
+    # Single-video modes
+    conditioning_path = _validated("conditioning", args.conditioning_video, "--conditioning-video")
     print(f"Using conditioning video: {conditioning_path}")
-    return str(conditioning_path)
+    return [(str(conditioning_path), args.video_strength)]
 
 
 def resolve_image_conditionings(args: argparse.Namespace, num_frames: int) -> list[ImageConditioningInput]:
@@ -358,7 +424,7 @@ def main() -> None:
         sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
     )
 
-    conditioning_video_path = validate_conditioning_video_path(args)
+    video_conditioning = resolve_conditioning_videos(args)
 
     pipeline = ICLoraPipeline(
         distilled_checkpoint_path=str(Path(args.distilled_checkpoint_path).expanduser().resolve()),
@@ -380,7 +446,7 @@ def main() -> None:
                 query_chunk_size=args.attention_probe_query_chunk_size,
                 metadata={
                     "reference_video": str(Path(args.reference_video).expanduser().resolve()),
-                    "conditioning_video": conditioning_video_path,
+                    "video_conditioning": [{"path": p, "strength": s} for p, s in video_conditioning],
                     "reference_image": str(Path(args.reference_image).expanduser().resolve()),
                     "output": str(Path(args.output).expanduser().resolve()),
                     "conditioning_mode": args.conditioning_mode,
@@ -410,12 +476,7 @@ def main() -> None:
         num_frames=num_frames,
         frame_rate=frame_rate,
         images=image_conditionings,
-        video_conditioning=[
-            (
-                conditioning_video_path,
-                args.video_strength,
-            )
-        ],
+        video_conditioning=video_conditioning,
         enhance_prompt=args.enhance_prompt,
         tiling_config=tiling_config,
         conditioning_attention_strength=args.conditioning_attention_strength,
@@ -440,7 +501,8 @@ def main() -> None:
     print(
         "Generation settings: "
         f"{width}x{height}, {num_frames} frames at {frame_rate:.3f} fps, "
-        f"image conditions={len(image_conditionings)}, video strength={args.video_strength}, "
+        f"image conditions={len(image_conditionings)}, "
+        f"video conditions={[(p, s) for p, s in video_conditioning]}, "
         f"conditioning mode={args.conditioning_mode}, "
         f"reference image replace="
         f"{sorted(reference_image_replace) if reference_image_replace is not None else 'default(0)'}"

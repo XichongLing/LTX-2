@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 SEQUENCE_TO_VIDEO_SCRIPT = SCRIPTS_DIR / "sequence_to_video.py"
 PRECOMPUTE_DEPTH_VIDEO_SCRIPT = SCRIPTS_DIR / "precompute_depth_video.py"
@@ -35,7 +35,7 @@ class PreparedStyleTransferInputs:
     source_reference_frames: list[str]
     reference_images: list[str]
     reference_frame_indices: list[int]
-    control_video: str
+    control_videos: list[str]
     work_dir: str
 
 
@@ -416,101 +416,151 @@ def create_edge_video_from_rgb(
         for packet in output_stream.encode():
             output_container.mux(packet)
 
-def resolve_control_video(args: argparse.Namespace, source_video: Path, input_path: Path, work_dir: Path) -> Path:
+def _resolve_depth_video(
+    args: argparse.Namespace,
+    source_video: Path,
+    input_path: Path,
+    controls_dir: Path,
+) -> Path:
+    if args.accept_gt_depths:
+        args.gt_depth_source_path = args.gt_depth_source_path or str(input_path)
+        missing = [
+            name
+            for name, value in (
+                ("--gt-depth-dir", args.gt_depth_dir),
+                ("--gt-depth-source-root", args.gt_depth_source_root),
+                ("--gt-depth-source-path", args.gt_depth_source_path),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError("--accept-gt-depths requires " + ", ".join(missing))
 
+        control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "gt_depth.mp4"
+        if is_readable_video_file(control_video):
+            print(f"Reusing existing GT-depth control video: {control_video}")
+            return control_video
+
+        from depth_control_adapter import create_gt_depth_control_video
+
+        _width, _height, frame_count, fps = read_video_metadata(str(source_video))
+        create_gt_depth_control_video(
+            dataset=args.gt_depth_dataset or args.dataset,
+            gt_depth_root=args.gt_depth_dir,
+            source_root=args.gt_depth_source_root,
+            source_path=args.gt_depth_source_path,
+            output_path=str(control_video),
+            fps=fps,
+            frame_cap=frame_count,
+        )
+        return control_video
+
+    if args.depth_backend != "video-depth-anything" and not args.depth_model:
+        raise ValueError(
+            "conditioning-mode=depth or rgb+depth requires --depth-model "
+            "unless --depth-backend video-depth-anything is used."
+        )
+    control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "depth.mp4"
+    if is_readable_video_file(control_video):
+        print(f"Reusing existing depth control video: {control_video}")
+        return control_video
+    create_depth_video_from_rgb(
+        rgb_video_path=str(source_video),
+        output_path=str(control_video),
+        depth_model_name_or_path=args.depth_model,
+        cache_dir=args.depth_cache_dir,
+        depth_backend=args.depth_backend,
+        depth_device=args.depth_device,
+        depth_use_fast=args.depth_use_fast,
+        video_depth_anything_root=args.video_depth_anything_root,
+        video_depth_anything_python=args.video_depth_anything_python,
+        video_depth_anything_encoder=args.video_depth_anything_encoder,
+        video_depth_anything_metric=args.video_depth_anything_metric,
+        video_depth_anything_input_size=args.video_depth_anything_input_size,
+        video_depth_anything_max_res=args.video_depth_anything_max_res,
+        video_depth_anything_max_len=args.video_depth_anything_max_len,
+        video_depth_anything_target_fps=args.video_depth_anything_target_fps,
+        video_depth_anything_fp32=args.video_depth_anything_fp32,
+    )
+    return control_video
+
+
+def _resolve_edge_video(args: argparse.Namespace, source_video: Path, controls_dir: Path) -> Path:
+    control_video = Path(args.edge_output).expanduser().resolve() if args.edge_output else controls_dir / "edge.mp4"
+    if is_readable_video_file(control_video):
+        print(f"Reusing existing edge control video: {control_video}")
+        return control_video
+    create_edge_video_from_rgb(
+        rgb_video_path=str(source_video),
+        output_path=str(control_video),
+        low_threshold=args.edge_low_threshold,
+        high_threshold=args.edge_high_threshold,
+    )
+    return control_video
+
+
+def resolve_control_videos(
+    args: argparse.Namespace,
+    source_video: Path,
+    input_path: Path,
+    work_dir: Path,
+) -> list[Path]:
     controls_dir = work_dir / "controls"
     controls_dir.mkdir(parents=True, exist_ok=True)
 
+    def _get_rgb() -> Path:
+        if getattr(args, "rgb_conditioning_video", None):
+            p = Path(args.rgb_conditioning_video).expanduser().resolve()
+            if not is_readable_video_file(p):
+                raise FileNotFoundError(f"rgb conditioning video does not exist or is unreadable: {p}")
+            print(f"Using provided RGB conditioning video: {p}")
+            return p
+        print(f"Using source video as RGB conditioning: {source_video}")
+        return source_video
+
+    def _get_depth() -> Path:
+        if getattr(args, "depth_conditioning_video", None):
+            p = Path(args.depth_conditioning_video).expanduser().resolve()
+            if not is_readable_video_file(p):
+                raise FileNotFoundError(f"depth conditioning video does not exist or is unreadable: {p}")
+            print(f"Using provided depth conditioning video: {p}")
+            return p
+        return _resolve_depth_video(args, source_video, input_path, controls_dir)
+
+    def _get_edge() -> Path:
+        if getattr(args, "edge_conditioning_video", None):
+            p = Path(args.edge_conditioning_video).expanduser().resolve()
+            if not is_readable_video_file(p):
+                raise FileNotFoundError(f"edge conditioning video does not exist or is unreadable: {p}")
+            print(f"Using provided edge conditioning video: {p}")
+            return p
+        return _resolve_edge_video(args, source_video, controls_dir)
+
+    if args.conditioning_mode == "rgb+depth":
+        return [_get_rgb(), _get_depth()]
+
+    if args.conditioning_mode == "edge+rgb":
+        return [_get_rgb(), _get_edge()]
+
+    if args.conditioning_mode == "edge+depth+rgb":
+        return [_get_rgb(), _get_depth(), _get_edge()]
+
+    # Single-video modes — optional explicit override applies to all of them
     if args.conditioning_video:
         control_video = Path(args.conditioning_video).expanduser().resolve()
         if not is_readable_video_file(control_video):
             raise FileNotFoundError(f"conditioning video does not exist or is unreadable: {control_video}")
         print(f"Using provided conditioning video: {control_video}")
-        return control_video
+        return [control_video]
 
     if args.conditioning_mode == "rgb":
-        return source_video
-
+        return [source_video]
     elif args.conditioning_mode == "depth":
-        if args.accept_gt_depths:
-            args.gt_depth_source_path = args.gt_depth_source_path or str(input_path)
-            missing = [
-                name
-                for name, value in (
-                    ("--gt-depth-dir", args.gt_depth_dir),
-                    ("--gt-depth-source-root", args.gt_depth_source_root),
-                    ("--gt-depth-source-path", args.gt_depth_source_path),
-                )
-                if not value
-            ]
-            if missing:
-                raise ValueError("--accept-gt-depths requires " + ", ".join(missing))
-
-            control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "gt_depth.mp4"
-            if is_readable_video_file(control_video):
-                print(f"Reusing existing GT-depth control video: {control_video}")
-                return control_video
-
-            from depth_control_adapter import create_gt_depth_control_video
-
-            _width, _height, frame_count, fps = read_video_metadata(str(source_video))
-            create_gt_depth_control_video(
-                dataset=args.gt_depth_dataset or args.dataset,
-                gt_depth_root=args.gt_depth_dir,
-                source_root=args.gt_depth_source_root,
-                source_path=args.gt_depth_source_path or str(input_path),
-                output_path=str(control_video),
-                fps=fps,
-                frame_cap=frame_count,
-            )
-            return control_video
-        
-        else:
-            if args.depth_backend != "video-depth-anything" and not args.depth_model:
-                raise ValueError(
-                    "conditioning-mode=depth requires --depth-model unless --depth-backend video-depth-anything is used."
-                )
-
-            control_video = Path(args.depth_output).expanduser().resolve() if args.depth_output else controls_dir / "depth.mp4"
-            if is_readable_video_file(control_video):
-                print(f"Reusing existing depth control video: {control_video}")
-                return control_video
-
-            create_depth_video_from_rgb(
-                rgb_video_path=str(source_video),
-                output_path=str(control_video),
-                depth_model_name_or_path=args.depth_model,
-                cache_dir=args.depth_cache_dir,
-                depth_backend=args.depth_backend,
-                depth_device=args.depth_device,
-                depth_use_fast=args.depth_use_fast,
-                video_depth_anything_root=args.video_depth_anything_root,
-                video_depth_anything_python=args.video_depth_anything_python,
-                video_depth_anything_encoder=args.video_depth_anything_encoder,
-                video_depth_anything_metric=args.video_depth_anything_metric,
-                video_depth_anything_input_size=args.video_depth_anything_input_size,
-                video_depth_anything_max_res=args.video_depth_anything_max_res,
-                video_depth_anything_max_len=args.video_depth_anything_max_len,
-                video_depth_anything_target_fps=args.video_depth_anything_target_fps,
-                video_depth_anything_fp32=args.video_depth_anything_fp32,
-            )
-            return control_video
+        return [_resolve_depth_video(args, source_video, input_path, controls_dir)]
     elif args.conditioning_mode == "edge":
-        control_video = Path(args.edge_output).expanduser().resolve() if args.edge_output else controls_dir / "edge.mp4"
-        if is_readable_video_file(control_video):
-            print(f"Reusing existing edge control video: {control_video}")
-            return control_video
-        create_edge_video_from_rgb(
-            rgb_video_path=str(source_video),
-            output_path=str(control_video),
-            low_threshold=args.edge_low_threshold,
-            high_threshold=args.edge_high_threshold,
-        )
-        return control_video
+        return [_resolve_edge_video(args, source_video, controls_dir)]
     else:
         raise ValueError(f"Unsupported conditioning mode: {args.conditioning_mode}")
-
-    return control_video
 
 def resolve_source_frames(args: argparse.Namespace, source_video: Path, work_dir: Path) -> list[Path]:
     _width, _height, frame_count, _fps = read_video_metadata(str(source_video))
@@ -547,7 +597,7 @@ def prepare_style_transfer_inputs(args: argparse.Namespace) -> PreparedStyleTran
     ]
     reference_first_frame = reference_images[0]
     
-    control_video = resolve_control_video(args, source_video, input_path, work_dir)
+    control_videos = resolve_control_videos(args, source_video, input_path, work_dir)
 
     return PreparedStyleTransferInputs(
         source_video=str(source_video),
@@ -556,7 +606,7 @@ def prepare_style_transfer_inputs(args: argparse.Namespace) -> PreparedStyleTran
         source_reference_frames=[str(path) for path in source_reference_frames],
         reference_images=[str(path) for path in reference_images],
         reference_frame_indices=reference_frame_indices,
-        control_video=str(control_video),
+        control_videos=[str(v) for v in control_videos],
         work_dir=str(work_dir),
     )
 
@@ -592,8 +642,43 @@ def add_preprocess_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flux-command-template", default=None)
     parser.add_argument("--flux-output-name", default="flux/translated_first_frame.png")
 
-    parser.add_argument("--conditioning-mode", choices=("rgb", "depth", "edge"), default="rgb")
+    parser.add_argument(
+        "--conditioning-mode",
+        choices=("rgb", "depth", "edge", "rgb+depth", "edge+rgb", "edge+depth+rgb"),
+        default="rgb",
+        help=(
+            "Conditioning signal(s) fed to IC-LoRA. "
+            "Single-signal modes: 'rgb' (source video), 'depth', 'edge'. "
+            "Multi-signal modes: 'rgb+depth' (RGB + depth map), "
+            "'edge+rgb' (RGB + edge map), "
+            "'edge+depth+rgb' (RGB + depth map + edge map)."
+        ),
+    )
     parser.add_argument("--conditioning-video", default=None)
+    parser.add_argument(
+        "--rgb-conditioning-video",
+        default=None,
+        help=(
+            "Override the RGB conditioning video in multi-signal modes. "
+            "Defaults to the source video."
+        ),
+    )
+    parser.add_argument(
+        "--depth-conditioning-video",
+        default=None,
+        help=(
+            "Pre-computed depth conditioning video for rgb+depth and edge+depth+rgb modes. "
+            "When omitted, depth is generated automatically from the source video."
+        ),
+    )
+    parser.add_argument(
+        "--edge-conditioning-video",
+        default=None,
+        help=(
+            "Pre-computed edge conditioning video for edge+rgb and edge+depth+rgb modes. "
+            "When omitted, edges are computed with Canny from the source video."
+        ),
+    )
     parser.add_argument("--depth-model", default=None)
     parser.add_argument("--depth-backend", choices=("auto", "image", "video-depth-anything"), default="auto")
     parser.add_argument("--depth-cache-dir", default=None)
