@@ -379,13 +379,13 @@ class LTXModel(torch.nn.Module):
 
             if self._enable_gradient_checkpointing and self.training:
                 video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
+                    lambda v, a: block(v, a, block_index=block_idx),
                     video,
                     audio,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(video=video, audio=audio)
+                video, audio = block(video=video, audio=audio, block_index=block_idx)
 
         return video, audio
 

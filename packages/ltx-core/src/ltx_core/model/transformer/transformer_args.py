@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from ltx_core.guidance.attention_hooks import AttentionHookContext
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
@@ -38,6 +39,7 @@ class TransformerArgs:
     self_attn_all_perturbed: bool = False
     cross_attn_perturbation_mask: torch.Tensor | None = None
     cross_attn_skip_all: bool = False
+    attention_hook_context: AttentionHookContext | None = None
 
 
 class BlockPerturbationsProcessor:
@@ -242,6 +244,7 @@ class TransformerArgsPreprocessor:
             enabled=modality.enabled,
             prompt_timestep=prompt_timestep,
             self_attention_mask=self_attention_mask,
+            attention_hook_context=modality.attention_hook_context,
         )
 
 

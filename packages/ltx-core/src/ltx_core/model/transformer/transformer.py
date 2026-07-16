@@ -253,6 +253,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
+        block_index: int | None = None,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
@@ -279,6 +280,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 mask=video.self_attention_mask,
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
+                attention_hook_context=video.attention_hook_context,
+                layer_index=block_index,
             )
             vx = vx + vx_msa_out * vgate_msa
             del vgate_msa, norm_vx, vx_msa_out

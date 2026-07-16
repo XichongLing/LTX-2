@@ -7,6 +7,7 @@ from typing import Protocol
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from ltx_core.guidance.attention_hooks import AttentionHookContext, AttentionInputs, AttentionMetadata
 from ltx_core.model.transformer.ops import (
     GatedAttentionCallable,
     PreAttentionCallable,
@@ -491,6 +492,9 @@ class Attention(torch.nn.Module):
         k_pe: torch.Tensor | None = None,
         perturbation_mask: torch.Tensor | None = None,
         all_perturbed: bool = False,
+        attention_hook_context: AttentionHookContext | None = None,
+        layer_index: int | None = None,
+        representation_stage: str = "post_rope",
     ) -> torch.Tensor:
         """Multi-head attention with optional RoPE, perturbation masking, and per-head gating.
         When ``perturbation_mask`` is all zeros, the expensive query/key path
@@ -529,6 +533,35 @@ class Attention(torch.nn.Module):
             q = self.to_q(x)
             k = self.to_k(context)
             q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
+            if attention_hook_context is not None and layer_index is not None:
+                metadata = AttentionMetadata(representation_stage=representation_stage)
+                if attention_hook_context.branch == "source":
+                    attention_hook_context.controller.record_source(
+                        step=attention_hook_context.step,
+                        layer_index=layer_index,
+                        k=k,
+                        v=v,
+                        metadata=metadata,
+                    )
+                elif attention_hook_context.branch == "target":
+                    modified_inputs = attention_hook_context.controller.modify_target(
+                        step=attention_hook_context.step,
+                        layer_index=layer_index,
+                        q=q,
+                        k=k,
+                        v=v,
+                        attention_mask=mask,
+                        metadata=metadata,
+                    )
+                    if not isinstance(modified_inputs, AttentionInputs):
+                        raise TypeError(
+                            "Attention controller must return AttentionInputs from modify_target, "
+                            f"got {type(modified_inputs)!r}"
+                        )
+                    q = modified_inputs.q
+                    k = modified_inputs.k
+                    v = modified_inputs.v
+                    mask = modified_inputs.attention_mask
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
             else:

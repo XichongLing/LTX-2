@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import torch
 
+from ltx_core.guidance.attention_hooks import AttentionHookContext
+
 
 @dataclass(frozen=True)
 class Modality:
@@ -53,6 +55,7 @@ class Modality:
     enabled: bool = True
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
+    attention_hook_context: AttentionHookContext | None = None
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""
@@ -65,5 +68,5 @@ class Modality:
             elif value is None or isinstance(value, bool):
                 split_fields[f.name] = [value] * n
             else:
-                raise TypeError(f"Cannot split field {f.name!r}: unsupported type {type(value)}")
+                split_fields[f.name] = [value] * n
         return [Modality(**{name: parts[i] for name, parts in split_fields.items()}) for i in range(n)]
