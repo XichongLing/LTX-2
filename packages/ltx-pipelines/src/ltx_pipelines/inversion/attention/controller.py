@@ -5,8 +5,8 @@ from dataclasses import dataclass
 import torch
 
 from ltx_core.guidance import AttentionInputs, AttentionMetadata, SamplingStep
-from ltx_pipelines.contextflow.attention.ace import ContextFlowACEPolicy
-from ltx_pipelines.contextflow.attention.feature_store import FeatureStore
+from ltx_pipelines.inversion.attention.ace import ContextFlowACEPolicy
+from ltx_pipelines.inversion.attention.feature_store import FeatureStore
 
 
 @dataclass

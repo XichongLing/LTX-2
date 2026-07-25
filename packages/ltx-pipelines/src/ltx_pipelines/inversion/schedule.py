@@ -3,6 +3,45 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+import torch
+
+
+CONTEXTFLOW_RAW_SIGMA_MIN = 0.003 / 1.002
+CONTEXTFLOW_SHIFT = 5.0
+CONTEXTFLOW_SIGMA_MIN = (
+    CONTEXTFLOW_SHIFT * CONTEXTFLOW_RAW_SIGMA_MIN
+    / (1.0 + (CONTEXTFLOW_SHIFT - 1.0) * CONTEXTFLOW_RAW_SIGMA_MIN)
+)
+
+
+class SigmaScheduler(Protocol):
+    def execute(self, steps: int, **kwargs: object) -> torch.Tensor: ...
+
+
+def contextflow_sigmas(
+    scheduler: SigmaScheduler,
+    *,
+    steps: int,
+    latent: torch.Tensor,
+    sigma_min: float = CONTEXTFLOW_SIGMA_MIN,
+) -> torch.Tensor:
+    """Build a symmetric non-zero sigma grid for ContextFlow inversion and reconstruction."""
+    if steps < 1:
+        raise ValueError("ContextFlow requires at least one solver step.")
+    if not 0.0 < sigma_min < 1.0:
+        raise ValueError("ContextFlow sigma_min must be in (0, 1).")
+
+    # LTX2Scheduler appends zero after its stretched terminal. Request one
+    # extra interval, then remove only zero to retain exactly `steps` updates.
+    sigmas = scheduler.execute(steps=steps + 1, latent=latent, terminal=sigma_min)[:-1]
+    if len(sigmas) != steps + 1:
+        raise ValueError(f"Expected {steps + 1} ContextFlow sigmas, got {len(sigmas)}.")
+    if not torch.isfinite(sigmas).all():
+        raise ValueError("ContextFlow sigma schedule contains non-finite values.")
+    if torch.any(sigmas <= 0) or torch.any(sigmas[1:] >= sigmas[:-1]):
+        raise ValueError("ContextFlow sigma schedule must be positive and strictly decreasing.")
+    return sigmas
+
 
 class InterventionSchedule(Protocol):
     def is_active(self, *, step_index: int, num_steps: int, layer_index: int) -> bool: ...

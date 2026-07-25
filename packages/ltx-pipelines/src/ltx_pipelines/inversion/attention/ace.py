@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from ltx_core.guidance import AttentionInputs, SamplingStep
-from ltx_pipelines.contextflow.schedule import InterventionSchedule
+from ltx_pipelines.inversion.schedule import InterventionSchedule
 
 TOKEN_DIM = 1
 

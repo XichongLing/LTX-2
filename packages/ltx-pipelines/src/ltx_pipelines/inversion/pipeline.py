@@ -9,10 +9,11 @@ from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder
 from ltx_core.types import VideoLatentShape, VideoPixelShape
-from ltx_pipelines.contextflow.config import BranchCondition
-from ltx_pipelines.contextflow.instrumentation import ContextFlowInstrumentation
-from ltx_pipelines.contextflow.inversion import RectifiedFlowInverter
-from ltx_pipelines.contextflow.trajectory import DualTrajectorySampler
+from ltx_pipelines.inversion.config import BranchCondition
+from ltx_pipelines.inversion.instrumentation import ContextFlowInstrumentation
+from ltx_pipelines.inversion.inversion import RectifiedFlowInverter
+from ltx_pipelines.inversion.schedule import contextflow_sigmas
+from ltx_pipelines.inversion.trajectory import DualTrajectorySampler
 from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, PromptEncoder, VideoDecoder
 from ltx_pipelines.utils.helpers import cleanup_memory
 
@@ -151,9 +152,11 @@ class ContextFlowPipeline:
             conditionings=reconstruction_condition.conditionings,
         )
 
-        timesteps = self.scheduler.execute(steps=self.num_inference_steps, latent=source_video_latent).to(
-            source_video_latent.device
-        )
+        timesteps = contextflow_sigmas(
+            self.scheduler,
+            steps=self.num_inference_steps,
+            latent=source_video_latent,
+        ).to(source_video_latent.device)
         video_fps = float(getattr(self.trajectory_sampler.video_tools, "fps", 24.0))
         pixel_shape = VideoPixelShape(
             batch=source_video_latent.shape[0],

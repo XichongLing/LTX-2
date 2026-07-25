@@ -10,14 +10,14 @@ from ltx_core.components.patchifiers import VideoLatentPatchifier
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape, VideoPixelShape
-from ltx_pipelines.contextflow.attention.ace import ContextFlowACEPolicy
-from ltx_pipelines.contextflow.attention.controller import ContextFlowAttentionController
-from ltx_pipelines.contextflow.attention.feature_store import FeatureStore
-from ltx_pipelines.contextflow.instrumentation import ContextFlowInstrumentation
-from ltx_pipelines.contextflow.inversion import RectifiedFlowInverter
-from ltx_pipelines.contextflow.pipeline import ContextFlowPipeline
-from ltx_pipelines.contextflow.schedule import LayerStepSchedule
-from ltx_pipelines.contextflow.trajectory import DualTrajectorySampler
+from ltx_pipelines.inversion.attention.ace import ContextFlowACEPolicy
+from ltx_pipelines.inversion.attention.controller import ContextFlowAttentionController
+from ltx_pipelines.inversion.attention.feature_store import FeatureStore
+from ltx_pipelines.inversion.instrumentation import ContextFlowInstrumentation
+from ltx_pipelines.inversion.inversion import RectifiedFlowInverter
+from ltx_pipelines.inversion.pipeline import ContextFlowPipeline
+from ltx_pipelines.inversion.schedule import LayerStepSchedule
+from ltx_pipelines.inversion.trajectory import DualTrajectorySampler
 from ltx_pipelines.utils.blocks import DiffusionStage, ImageConditioner, PromptEncoder, VideoDecoder
 from ltx_pipelines.utils.helpers import get_device
 from ltx_pipelines.utils.quantization_factory import QuantizationKind

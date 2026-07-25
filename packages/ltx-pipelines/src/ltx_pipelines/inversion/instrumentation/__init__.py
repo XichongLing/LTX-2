@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 
 import torch
 
-from ltx_pipelines.contextflow.instrumentation.memory import tensor_nbytes
-from ltx_pipelines.contextflow.instrumentation.tensor_stats import mean_cosine_similarity, tensor_stats
+from ltx_pipelines.inversion.instrumentation.memory import tensor_nbytes
+from ltx_pipelines.inversion.instrumentation.tensor_stats import mean_cosine_similarity, tensor_stats
 
 
 @dataclass
