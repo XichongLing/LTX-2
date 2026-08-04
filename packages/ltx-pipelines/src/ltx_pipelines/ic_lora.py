@@ -8,10 +8,14 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import (
     ConditioningItem,
     ConditioningItemAttentionStrengthWrapper,
+    ConditioningItemCorrespondenceBiasWrapper,
     VideoConditionByReferenceLatent,
 )
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import (
+    CompilationConfig,
+)
 from ltx_core.model.video_vae import (
     SpatialTilingConfig,
     TemporalTilingConfig,
@@ -19,13 +23,14 @@ from ltx_core.model.video_vae import (
     VideoEncoder,
     get_video_chunks_number,
 )
-from ltx_core.model.transformer.compiling import (
-    CompilationConfig,
-)
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
+from ltx_pipelines.correspondence_mask import (
+    build_masked_denoise_mask,
+    downsample_disocclusion_mask_to_target_tokens,
+)
 from ltx_pipelines.iclora_utils import (
-    append_ic_lora_reference_video_conditionings,
+    downsample_mask_video_to_latent,
     read_lora_reference_downscale_factor,
 )
 from ltx_pipelines.utils.args import (
@@ -159,6 +164,11 @@ class ICLoraPipeline:
         attention_probe: object | None = None,
         reference_image_replace: set[int] | None = None,
         first_frame_attention_multiplier: float = 1.0,
+        initial_video_latent: torch.Tensor | None = None,
+        correspondence_mask: torch.Tensor | None = None,
+        source_correspondence_bias: float = 0.0,
+        source_correspondence_radius: int = 0,
+        stage_2_masked_denoise_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -199,6 +209,16 @@ class ICLoraPipeline:
             first_frame_attention_multiplier: Attention multiplier for future target
                 tokens attending to in-place frame-0 replacement tokens. 1.0 preserves
                 current behavior; values >1.0 add positive attention-logit bias.
+            correspondence_mask: Stage-1 pixel-space mask of shape (B,1,F,H,W).
+                Values gate a directional target-query to RGB-source-key bias.
+            source_correspondence_bias: Non-negative additive attention-logit bias
+                applied at full mask confidence. Zero disables the feature.
+            source_correspondence_radius: Radius, in source latent cells, around
+                each aligned source key that receives the bias.
+            stage_2_masked_denoise_strength: Per-token Stage-2 denoising strength in
+                fully masked target regions. One preserves current behavior;
+                zero locks those tokens to the upsampled Stage-1 latent. Intermediate
+                values scale initial noise, model timesteps, and preservation blending.
         Returns:
             Tuple of (video_iterator, audio_tensor).
         """
@@ -208,10 +228,22 @@ class ICLoraPipeline:
                 f"conditioning_attention_strength must be in [0.0, 1.0], got {conditioning_attention_strength}"
             )
         if first_frame_attention_multiplier <= 0.0:
+            raise ValueError(f"first_frame_attention_multiplier must be > 0.0, got {first_frame_attention_multiplier}")
+        if source_correspondence_bias < 0.0:
+            raise ValueError(f"source_correspondence_bias must be non-negative, got {source_correspondence_bias}")
+        if source_correspondence_radius < 0:
+            raise ValueError(f"source_correspondence_radius must be non-negative, got {source_correspondence_radius}")
+        if not 0.0 <= stage_2_masked_denoise_strength <= 1.0:
             raise ValueError(
-                "first_frame_attention_multiplier must be > 0.0, "
-                f"got {first_frame_attention_multiplier}"
+                "stage_2_masked_denoise_strength must be in [0, 1], "
+                f"got {stage_2_masked_denoise_strength}"
             )
+        if stage_2_masked_denoise_strength < 1.0 and correspondence_mask is None:
+            raise ValueError(
+                "correspondence_mask is required when stage_2_masked_denoise_strength is below 1"
+            )
+        if source_correspondence_bias > 0.0 and correspondence_mask is None:
+            raise ValueError("correspondence_mask is required when source_correspondence_bias is positive")
         if video_cfg_scale < 1.0:
             raise ValueError(f"video_cfg_scale must be >= 1.0, got {video_cfg_scale}")
         if audio_cfg_scale < 1.0:
@@ -258,6 +290,9 @@ class ICLoraPipeline:
                 conditioning_attention_mask=conditioning_attention_mask,
                 # reference_image_replace=reference_image_replace,
                 first_frame_attention_multiplier=first_frame_attention_multiplier,
+                correspondence_mask=correspondence_mask,
+                source_correspondence_bias=source_correspondence_bias,
+                source_correspondence_radius=source_correspondence_radius,
             )
         )
 
@@ -285,6 +320,11 @@ class ICLoraPipeline:
             video=ModalitySpec(
                 context=video_context,
                 conditionings=stage_1_conditionings,
+                initial_latent=(
+                    initial_video_latent.to(device=self.device, dtype=self.dtype)
+                    if initial_video_latent is not None
+                    else None
+                ),
             ),
             audio=ModalitySpec(
                 context=audio_context,
@@ -321,6 +361,18 @@ class ICLoraPipeline:
 
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
+        stage_2_denoise_mask = None
+        if stage_2_masked_denoise_strength < 1.0:
+            stage_2_target_shape = VideoLatentShape.from_pixel_shape(stage_2_output_shape)
+            stage_2_denoise_mask = build_masked_denoise_mask(
+                correspondence_mask.to(device=self.device),
+                stage_2_target_shape,
+                stage_2_masked_denoise_strength,
+            )
+            logging.info(
+                "[IC-LoRA] Stage 2 masked per-token denoise strength: %.4f",
+                stage_2_masked_denoise_strength,
+            )
         logging.info(
             "[IC-LoRA] Stage 2 target pixel shape: "
             f"(B={stage_2_output_shape.batch}, C=3, F={stage_2_output_shape.frames}, "
@@ -352,6 +404,7 @@ class ICLoraPipeline:
                 context=video_context,
                 conditionings=stage_2_conditionings,
                 noise_scale=stage_2_sigmas[0].item(),
+                denoise_mask=stage_2_denoise_mask,
                 initial_latent=upscaled_video_latent,
             ),
             audio=ModalitySpec(
@@ -388,6 +441,9 @@ class ICLoraPipeline:
         conditioning_attention_mask: torch.Tensor | None = None,
         reference_image_replace: set[int] | None = None,
         first_frame_attention_multiplier: float = 1.0,
+        correspondence_mask: torch.Tensor | None = None,
+        source_correspondence_bias: float = 0.0,
+        source_correspondence_radius: int = 0,
     ) -> list[ConditioningItem]:
         """
         Create conditioning items for video generation.
@@ -425,7 +481,16 @@ class ICLoraPipeline:
         ref_height = height // scale
         ref_width = width // scale
 
-        for video_path, strength in video_conditioning:
+        target_correspondence_mask = None
+        if correspondence_mask is not None and source_correspondence_bias > 0.0:
+            target_shape = VideoLatentShape.from_pixel_shape(
+                VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=1.0)
+            )
+            target_correspondence_mask = downsample_disocclusion_mask_to_target_tokens(
+                correspondence_mask.to(device=self.device), target_shape
+            )
+
+        for conditioning_index, (video_path, strength) in enumerate(video_conditioning):
             # Load video at scaled-down resolution (if scale > 1)
             frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=self.device)
             video = video_preprocess(frame_gen, ref_height, ref_width, self.dtype, self.device)
@@ -441,7 +506,7 @@ class ICLoraPipeline:
             # Build attention_mask for ConditioningItemAttentionStrengthWrapper
             if conditioning_attention_mask is not None:
                 # Downsample pixel-space mask to latent space, then scale by strength
-                latent_mask = self._downsample_mask_to_latent(
+                latent_mask = downsample_mask_video_to_latent(
                     mask=conditioning_attention_mask,
                     target_latent_shape=reference_video_shape,
                 )
@@ -459,6 +524,15 @@ class ICLoraPipeline:
             )
             if attn_mask is not None:
                 cond = ConditioningItemAttentionStrengthWrapper(cond, attention_mask=attn_mask)
+            if conditioning_index == 0 and target_correspondence_mask is not None:
+                cond = ConditioningItemCorrespondenceBiasWrapper(
+                    cond,
+                    target_mask=target_correspondence_mask,
+                    reference_shape=reference_video_shape,
+                    logit_bias=source_correspondence_bias,
+                    radius=source_correspondence_radius,
+                )
+                logging.info("[IC-LoRA] Added target-to-source correspondence bias to first video condition")
             conditionings.append(cond)
 
         if video_conditioning:

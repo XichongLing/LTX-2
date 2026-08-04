@@ -5,6 +5,7 @@ from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.types import (
     AudioConditionByReferenceLatent,
     ConditioningItemAttentionStrengthWrapper,
+    ConditioningItemCorrespondenceBiasWrapper,
     VideoConditionByKeyframeIndex,
     VideoConditionByLatentIndex,
     VideoConditionByReferenceLatent,
@@ -15,6 +16,7 @@ __all__ = [
     "ConditioningError",
     "ConditioningItem",
     "ConditioningItemAttentionStrengthWrapper",
+    "ConditioningItemCorrespondenceBiasWrapper",
     "VideoConditionByKeyframeIndex",
     "VideoConditionByLatentIndex",
     "VideoConditionByReferenceLatent",

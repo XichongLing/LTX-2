@@ -151,22 +151,22 @@ class TransformerArgsPreprocessor:
     def _prepare_self_attention_mask(
         self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
     ) -> torch.Tensor | None:
-        """Prepare self-attention mask by converting [0,1] values to additive log-space bias.
-        Input shape: 3D ``(B, T_q, T_k)`` with values in [0, 1]. The dense form
+        """Convert non-negative self-attention weights to additive log-space bias.
+        Input shape: 3D ``(B, T_q, T_k)``. The dense form
         is ``(B, T, T)``; broadcastable forms like ``(1, 1, T)`` (key-only
         padding) or ``(B, 1, T)`` are also valid and yield a correspondingly
         broadcastable output.
         Output shape: ``(B, 1, T_q, T_k)`` (heads dim inserted) with 0.0 for
         full attention and a large negative value for masked positions.
-        Positions with attention_mask <= 0 are fully masked (mapped to the dtype's minimum
-        representable value). Strictly positive entries are converted via log-space for
-        smooth attenuation, with small values clamped for numerical stability.
+        Positions with attention_mask <= 0 are fully masked. Positive entries
+        are converted with ``log``: below 1 attenuates, 1 is neutral, and above
+        1 boosts attention.
         Returns None if input is None (no masking).
         """
         if attention_mask is None:
             return None
 
-        # Convert [0, 1] attention mask to additive log-space bias:
+        # Convert non-negative attention weights to additive log-space bias:
         #   1.0 -> log(1.0) = 0.0  (no bias, full attention)
         #   0.0 -> finfo.min        (fully masked)
         finfo = torch.finfo(x_dtype)

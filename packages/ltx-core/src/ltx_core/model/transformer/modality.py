@@ -33,10 +33,10 @@ class Modality:
         context: Text conditioning embeddings from the prompt encoder.
         enabled: Whether this modality is active in the current forward pass.
         context_mask: Optional mask for the text context tokens.
-        attention_mask: Optional 2-D self-attention mask, shape ``(B, T, T)``.
-            Values in ``[0, 1]`` where ``1`` = full attention and ``0`` = no
-            attention. ``None`` means unrestricted (full) attention between
-            all tokens. Built incrementally by conditioning items; see
+        attention_mask: Optional self-attention weight matrix, shape ``(B, T, T)``.
+            Non-negative values become additive log-space bias: ``1`` = no bias,
+            ``0`` = fully masked, and values above ``1`` boost attention. ``None``
+            means weight ``1`` everywhere. Built incrementally; see
             :class:`~ltx_core.conditioning.types.attention_strength_wrapper.ConditioningItemAttentionStrengthWrapper`.
     """
 

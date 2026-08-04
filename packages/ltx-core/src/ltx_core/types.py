@@ -191,8 +191,10 @@ class LatentState:
         denoise_mask: Mask encoding the denoising strength for each token (1 = full denoising, 0 = no denoising).
         positions: Positional indices for each latent element, used for positional embeddings.
         clean_latent: Initial state of the latent before denoising, may include conditioning latents.
-        attention_mask: Optional 2D self-attention mask of shape (B, T, T). Values in [0, 1] where 1 = full attention,
-            0 = no attention. None means full attention everywhere. Built incrementally by conditioning items.
+        attention_mask: Optional 2D self-attention weight matrix of shape (B, T, T).
+            Non-negative values become additive log-space bias: 1 = no bias,
+            0 = fully masked, and values above 1 boost attention. None means
+            weight 1 everywhere. Built incrementally by conditioning items.
     """
 
     latent: torch.Tensor
