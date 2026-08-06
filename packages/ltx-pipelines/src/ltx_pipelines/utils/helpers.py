@@ -228,6 +228,7 @@ def create_noised_state(
     dtype: torch.dtype,
     device: torch.device,
     noise_scale: float = 1.0,
+    denoise_mask: torch.Tensor | None = None,
     initial_latent: torch.Tensor | None = None,
 ) -> LatentState:
     """Create a noised latent state from empty state, conditionings, and noiser.
@@ -236,6 +237,11 @@ def create_noised_state(
     """
     state = tools.create_initial_state(device, dtype, initial_latent)
     state = state_with_conditionings(state, conditionings, tools)
+    if denoise_mask is not None:
+        target_mask = denoise_mask.to(device=state.denoise_mask.device, dtype=state.denoise_mask.dtype)
+        if target_mask.dim() == 2:
+            target_mask = target_mask.unsqueeze(-1)
+        state.denoise_mask[:, : target_mask.shape[1]] = target_mask
     state = noiser(state, noise_scale)
 
     return state

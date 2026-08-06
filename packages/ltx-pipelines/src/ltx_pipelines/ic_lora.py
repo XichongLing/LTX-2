@@ -86,9 +86,12 @@ class ICLoraPipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        stage_2_loras: list[LoraPathStrengthAndSDOps] | None = None,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        stage_2_loras = stage_2_loras or []
+        self.stage_2_ic_lora_enabled = bool(stage_2_loras)
 
         self.prompt_encoder = PromptEncoder(
             distilled_checkpoint_path,
@@ -113,7 +116,7 @@ class ICLoraPipeline:
             distilled_checkpoint_path,
             self.dtype,
             self.device,
-            loras=(),
+            loras=tuple(stage_2_loras),
             quantization=quantization,
             registry=registry,
             compilation_config=compilation_config,
@@ -129,7 +132,7 @@ class ICLoraPipeline:
         # IC-LoRAs trained with low-resolution reference videos store this factor
         # so inference can resize reference videos to match training conditions.
         self.reference_downscale_factor = 1
-        for lora in loras:
+        for lora in (*loras, *stage_2_loras):
             scale = read_lora_reference_downscale_factor(lora.path)
             if scale != 1:
                 if self.reference_downscale_factor not in (1, scale):
@@ -169,6 +172,7 @@ class ICLoraPipeline:
         source_correspondence_bias: float = 0.0,
         source_correspondence_radius: int = 0,
         stage_2_masked_denoise_strength: float = 1.0,
+        stage_2_conditioning_attention_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
         Generate video with IC-LoRA conditioning.
@@ -219,6 +223,8 @@ class ICLoraPipeline:
                 fully masked target regions. One preserves current behavior;
                 zero locks those tokens to the upsampled Stage-1 latent. Intermediate
                 values scale initial noise, model timesteps, and preservation blending.
+            stage_2_conditioning_attention_strength: Attention strength for source-video
+                reference tokens appended during Stage 2 when Stage 2 IC-LoRA is enabled.
         Returns:
             Tuple of (video_iterator, audio_tensor).
         """
@@ -238,6 +244,13 @@ class ICLoraPipeline:
                 "stage_2_masked_denoise_strength must be in [0, 1], "
                 f"got {stage_2_masked_denoise_strength}"
             )
+        if not 0.0 <= stage_2_conditioning_attention_strength <= 1.0:
+            raise ValueError(
+                "stage_2_conditioning_attention_strength must be in [0, 1], "
+                f"got {stage_2_conditioning_attention_strength}"
+            )
+        if self.stage_2_ic_lora_enabled and not video_conditioning:
+            raise ValueError("Stage 2 IC-LoRA requires at least one source-video conditioning")
         if stage_2_masked_denoise_strength < 1.0 and correspondence_mask is None:
             raise ValueError(
                 "correspondence_mask is required when stage_2_masked_denoise_strength is below 1"
@@ -378,19 +391,39 @@ class ICLoraPipeline:
             f"(B={stage_2_output_shape.batch}, C=3, F={stage_2_output_shape.frames}, "
             f"H={stage_2_output_shape.height}, W={stage_2_output_shape.width})"
         )
-        stage_2_conditionings = self.image_conditioner(
-            lambda enc: combined_image_conditionings(
-                images=images,
-                height=stage_2_output_shape.height,
-                width=stage_2_output_shape.width,
-                video_encoder=enc,
-                dtype=self.dtype,
-                device=self.device,
-                # reference_image_replace=reference_image_replace,
-                # num_frames=num_frames,
-                # first_frame_attention_multiplier=first_frame_attention_multiplier,
+        if self.stage_2_ic_lora_enabled:
+            stage_2_conditionings = self.image_conditioner(
+                lambda enc: self._create_conditionings(
+                    images=images,
+                    video_conditioning=video_conditioning,
+                    height=stage_2_output_shape.height,
+                    width=stage_2_output_shape.width,
+                    video_encoder=enc,
+                    num_frames=num_frames,
+                    conditioning_attention_strength=stage_2_conditioning_attention_strength,
+                    conditioning_attention_mask=conditioning_attention_mask,
+                )
             )
-        )
+            logging.info(
+                "[IC-LoRA] Stage 2 IC-LoRA enabled with %d source-video condition(s), "
+                "conditioning attention strength %.4f",
+                len(video_conditioning),
+                stage_2_conditioning_attention_strength,
+            )
+        else:
+            stage_2_conditionings = self.image_conditioner(
+                lambda enc: combined_image_conditionings(
+                    images=images,
+                    height=stage_2_output_shape.height,
+                    width=stage_2_output_shape.width,
+                    video_encoder=enc,
+                    dtype=self.dtype,
+                    device=self.device,
+                    # reference_image_replace=reference_image_replace,
+                    # num_frames=num_frames,
+                    # first_frame_attention_multiplier=first_frame_attention_multiplier,
+                )
+            )
 
         video_state, audio_state = self.stage_2(
             denoiser=SimpleDenoiser(video_context, audio_context),

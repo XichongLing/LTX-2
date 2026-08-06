@@ -10,7 +10,6 @@ from pathlib import Path
 import av
 import torch
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_SRC_DIRS = (
     REPO_ROOT / "packages" / "ltx-core" / "src",
@@ -21,16 +20,22 @@ for src_dir in PACKAGE_SRC_DIRS:
     if src_str not in sys.path:
         sys.path.insert(0, src_str)
 
-from ltx_core.loader import LoraPathStrengthAndSDOps, LTXV_LORA_COMFY_RENAMING_MAP
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_pipelines import ICLoraPipeline
-from ltx_pipelines.utils.attention_probe import AttentionProbe, AttentionProbeConfig, parse_index_set
+from ltx_pipelines.correspondence_mask import (
+    CorrespondenceMaskBox,
+    build_box_mask,
+    build_later_frames_mask,
+    load_file_mask,
+)
 from ltx_pipelines.utils.args import (
+    QUANTIZATION_POLICIES,
     ImageConditioningInput,
     QuantizationAction,
-    QUANTIZATION_POLICIES,
     _PipelineArgumentParser,
 )
+from ltx_pipelines.utils.attention_probe import AttentionProbe, AttentionProbeConfig, parse_index_set
 from ltx_pipelines.utils.media_io import encode_video
 
 
@@ -69,7 +74,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-upsampler-path", required=True, help="Path to the spatial upsampler checkpoint.")
     parser.add_argument("--gemma-root", required=True, help="Path to the Gemma text-encoder directory.")
     parser.add_argument("--ic-lora-path", required=True, help="Path to the IC-LoRA weights.")
-    parser.add_argument("--reference-video", required=True, help="Reference video whose motion and camera should be followed.")
+    parser.add_argument(
+        "--reference-video", required=True, help="Reference video whose motion and camera should be followed."
+    )
     parser.add_argument(
         "--conditioning-video",
         required=True,
@@ -80,8 +87,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--reference-image",
-        required=True,
+        default=None,
         help="Reference image whose style/appearance should influence the output.",
+    )
+    parser.add_argument(
+        "--no-image-conditioning",
+        action="store_true",
+        help=(
+            "Disable all reference-image conditioning. When enabled, no default image condition "
+            "is created and Stage 2 runs without an image anchor."
+        ),
     )
     parser.add_argument(
         "--image-condition",
@@ -115,10 +130,22 @@ def parse_args() -> argparse.Namespace:
         ),
         help="Prompt to pair with the video and image conditioning.",
     )
-    parser.add_argument("--negative-prompt", default="", help="Optional negative prompt text appended to the main prompt.")
+    parser.add_argument(
+        "--negative-prompt", default="", help="Optional negative prompt text appended to the main prompt."
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--height", type=int, default=None, help="Output height. Defaults to the reference video height rounded down to a multiple of 64.")
-    parser.add_argument("--width", type=int, default=None, help="Output width. Defaults to the reference video width rounded down to a multiple of 64.")
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Output height. Defaults to the reference video height rounded down to a multiple of 64.",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Output width. Defaults to the reference video width rounded down to a multiple of 64.",
+    )
     parser.add_argument(
         "--num-frames",
         type=int,
@@ -137,9 +164,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Frame index where the reference image is injected as image conditioning.",
     )
-    parser.add_argument("--image-strength", type=float, default=1.0, help="Strength for the reference image conditioning.")
-    parser.add_argument("--image-crf", type=int, default=33, help="CRF-like preprocessing parameter for image conditioning.")
-    parser.add_argument("--video-strength", type=float, default=1.0, help="Strength for the reference video IC-LoRA conditioning.")
+    parser.add_argument(
+        "--image-strength", type=float, default=1.0, help="Strength for the reference image conditioning."
+    )
+    parser.add_argument(
+        "--image-crf", type=int, default=33, help="CRF-like preprocessing parameter for image conditioning."
+    )
+    parser.add_argument(
+        "--video-strength", type=float, default=1.0, help="Strength for the reference video IC-LoRA conditioning."
+    )
     parser.add_argument(
         "--conditioning-mode",
         choices=("rgb", "depth", "edge", "rgb+depth", "edge+rgb", "edge+depth+rgb"),
@@ -184,6 +217,75 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=1.0,
         help="How strongly the reference video conditioning should influence attention, in [0, 1].",
+    )
+    parser.add_argument(
+        "--stage-2-ic-lora-strength",
+        type=float,
+        default=0.0,
+        help=(
+            "IC-LoRA adapter strength in Stage 2. Zero preserves the previous image-only Stage 2; "
+            "a positive value also appends the source-video reference tokens in Stage 2."
+        ),
+    )
+    parser.add_argument(
+        "--stage-2-conditioning-attention-strength",
+        type=float,
+        default=1.0,
+        help="Stage-2 source-video conditioning attention strength, in [0, 1].",
+    )
+    parser.add_argument(
+        "--correspondence-mask-mode",
+        choices=("later-frames", "boxes", "file"),
+        default="later-frames",
+        help=(
+            "Mask source for target-to-source attention bias. The default biases all pixels after frame 0; "
+            "'boxes' uses --correspondence-mask-box and 'file' uses --correspondence-mask-file."
+        ),
+    )
+    parser.add_argument(
+        "--correspondence-mask-file",
+        default=None,
+        help="Mask video, image, PNG directory, .npy, or .pt used with --correspondence-mask-mode file.",
+    )
+    parser.add_argument(
+        "--correspondence-mask-box",
+        type=float,
+        nargs=6,
+        action="append",
+        default=None,
+        metavar=("START", "END", "X0", "Y0", "X1", "Y1"),
+        help=(
+            "Frame-inclusive box with normalized coordinates, used with mask mode 'boxes'. "
+            "May be repeated. START and END must be integer-valued."
+        ),
+    )
+    parser.add_argument(
+        "--correspondence-mask-feather",
+        type=int,
+        default=0,
+        help="Box-mask feather radius in Stage-1 pixels. Default: 0.",
+    )
+    parser.add_argument(
+        "--source-correspondence-bias",
+        type=float,
+        default=0.0,
+        help="Additive pre-softmax target-to-source correspondence bias. Zero disables the feature.",
+    )
+    parser.add_argument(
+        "--source-correspondence-radius",
+        type=int,
+        default=0,
+        help="Source-latent neighborhood radius receiving the correspondence bias. Default: 0.",
+    )
+    parser.add_argument(
+        "--stage-2-masked-denoise-strength",
+        "--stage-2-masked-noise-strength",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-token Stage-2 denoising strength inside the correspondence mask. "
+            "One preserves current behavior; zero locks those tokens to the upsampled Stage-1 latent."
+        ),
     )
     parser.add_argument(
         "--skip-stage-2",
@@ -244,6 +346,11 @@ def parse_args() -> argparse.Namespace:
             f"Quantization policy: {', '.join(QUANTIZATION_POLICIES)}. "
             "Example: --quantization fp8-cast or --quantization fp8-scaled-mm /path/to/amax.json"
         ),
+    )
+    parser.add_argument(
+        "--initial-video-latent",
+        default=None,
+        help="Optional path to a saved Stage 1 video latent tensor (.pt) used instead of Gaussian noise.",
     )
     return parser.parse_args()
 
@@ -344,6 +451,14 @@ def resolve_conditioning_videos(args: argparse.Namespace) -> list[tuple[str, flo
 
 
 def resolve_image_conditionings(args: argparse.Namespace, num_frames: int) -> list[ImageConditioningInput]:
+    if args.no_image_conditioning:
+        if args.image_condition:
+            raise ValueError("--no-image-conditioning cannot be combined with --image-condition.")
+        return []
+
+    if not args.reference_image:
+        raise ValueError("--reference-image is required unless --no-image-conditioning is used.")
+
     image_conditionings = args.image_condition or [
         ImageConditioningInput(
             path=str(Path(args.reference_image).expanduser().resolve()),
@@ -369,9 +484,7 @@ def resolve_reference_image_replace(
     replace_frame_indices = sorted(set(args.reference_image_replace))
     out_of_range = [idx for idx in replace_frame_indices if idx < 0 or idx >= num_frames]
     if out_of_range:
-        raise ValueError(
-            f"reference-image-replace frame index must be in [0, {num_frames - 1}]: {out_of_range}"
-        )
+        raise ValueError(f"reference-image-replace frame index must be in [0, {num_frames - 1}]: {out_of_range}")
 
     image_frame_indices = {conditioning.frame_idx for conditioning in image_conditionings}
     missing = [idx for idx in replace_frame_indices if idx not in image_frame_indices]
@@ -407,6 +520,34 @@ def main() -> None:
         raise ValueError("num_frames must be positive.")
     if not (0.0 <= args.conditioning_attention_strength <= 1.0):
         raise ValueError("conditioning_attention_strength must be between 0.0 and 1.0.")
+    if args.stage_2_ic_lora_strength < 0.0:
+        raise ValueError("--stage-2-ic-lora-strength must be non-negative.")
+    if not 0.0 <= args.stage_2_conditioning_attention_strength <= 1.0:
+        raise ValueError("--stage-2-conditioning-attention-strength must be between 0.0 and 1.0.")
+    if args.skip_stage_2 and args.stage_2_ic_lora_strength > 0.0:
+        raise ValueError("--stage-2-ic-lora-strength has no effect with --skip-stage-2.")
+    if args.source_correspondence_bias < 0.0:
+        raise ValueError("--source-correspondence-bias must be non-negative.")
+    if args.source_correspondence_radius < 0:
+        raise ValueError("--source-correspondence-radius must be non-negative.")
+    if args.correspondence_mask_feather < 0:
+        raise ValueError("--correspondence-mask-feather must be non-negative.")
+    if not 0.0 <= args.stage_2_masked_denoise_strength <= 1.0:
+        raise ValueError("--stage-2-masked-denoise-strength must be between 0.0 and 1.0.")
+    if args.skip_stage_2 and args.stage_2_masked_denoise_strength < 1.0:
+        raise ValueError("--stage-2-masked-denoise-strength has no effect with --skip-stage-2.")
+    if args.source_correspondence_bias > 0.0 and "rgb" not in args.conditioning_mode:
+        raise ValueError("Source correspondence bias requires an RGB conditioning mode.")
+    if args.correspondence_mask_mode == "file" and not args.correspondence_mask_file:
+        raise ValueError("--correspondence-mask-file is required when mask mode is 'file'.")
+    if args.correspondence_mask_mode == "boxes" and not args.correspondence_mask_box:
+        raise ValueError("At least one --correspondence-mask-box is required when mask mode is 'boxes'.")
+    if args.correspondence_mask_box and any(
+        values[0] != int(values[0]) or values[1] != int(values[1]) for values in args.correspondence_mask_box
+    ):
+        raise ValueError("Correspondence box START and END values must be integers.")
+    if args.no_image_conditioning and args.enhance_prompt:
+        raise ValueError("--enhance-prompt requires a reference image and cannot be used with --no-image-conditioning.")
     image_conditionings = resolve_image_conditionings(args, num_frames)
     reference_image_replace = resolve_reference_image_replace(args, image_conditionings, num_frames)
 
@@ -423,14 +564,58 @@ def main() -> None:
         strength=1.0,
         sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
     )
+    stage_2_loras = []
+    if args.stage_2_ic_lora_strength > 0.0:
+        stage_2_loras.append(
+            LoraPathStrengthAndSDOps(
+                path=lora.path,
+                strength=args.stage_2_ic_lora_strength,
+                sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
+            )
+        )
 
     video_conditioning = resolve_conditioning_videos(args)
+
+    correspondence_mask = None
+    if args.source_correspondence_bias > 0.0 or args.stage_2_masked_denoise_strength < 1.0:
+        stage_1_height, stage_1_width = height // 2, width // 2
+        if args.correspondence_mask_mode == "later-frames":
+            correspondence_mask = build_later_frames_mask(
+                num_frames=num_frames,
+                height=stage_1_height,
+                width=stage_1_width,
+            )
+        elif args.correspondence_mask_mode == "boxes":
+            boxes = [
+                CorrespondenceMaskBox(int(values[0]), int(values[1]), *values[2:])
+                for values in args.correspondence_mask_box
+            ]
+            correspondence_mask = build_box_mask(
+                boxes=boxes,
+                num_frames=num_frames,
+                height=stage_1_height,
+                width=stage_1_width,
+                feather=args.correspondence_mask_feather,
+            )
+        else:
+            correspondence_mask = load_file_mask(
+                path=args.correspondence_mask_file,
+                num_frames=num_frames,
+                height=stage_1_height,
+                width=stage_1_width,
+            )
+        print(
+            f"Using correspondence mask mode={args.correspondence_mask_mode}, "
+            f"bias={args.source_correspondence_bias}, radius={args.source_correspondence_radius}, "
+            f"stage_2_masked_denoise_strength={args.stage_2_masked_denoise_strength}"
+        )
 
     pipeline = ICLoraPipeline(
         distilled_checkpoint_path=str(Path(args.distilled_checkpoint_path).expanduser().resolve()),
         spatial_upsampler_path=str(Path(args.spatial_upsampler_path).expanduser().resolve()),
         gemma_root=str(Path(args.gemma_root).expanduser().resolve()),
         loras=[lora],
+        stage_2_loras=stage_2_loras,
         device=torch.device("cuda"),
         quantization=args.quantization,
     )
@@ -447,11 +632,22 @@ def main() -> None:
                 metadata={
                     "reference_video": str(Path(args.reference_video).expanduser().resolve()),
                     "video_conditioning": [{"path": p, "strength": s} for p, s in video_conditioning],
-                    "reference_image": str(Path(args.reference_image).expanduser().resolve()),
+                    "reference_image": (
+                        str(Path(args.reference_image).expanduser().resolve()) if args.reference_image else None
+                    ),
                     "output": str(Path(args.output).expanduser().resolve()),
+                    "correspondence_mask_mode": args.correspondence_mask_mode,
+                    "correspondence_mask_file": args.correspondence_mask_file,
+                    "correspondence_mask_boxes": args.correspondence_mask_box,
+                    "source_correspondence_bias": args.source_correspondence_bias,
+                    "source_correspondence_radius": args.source_correspondence_radius,
                     "conditioning_mode": args.conditioning_mode,
+                    "stage_2_masked_denoise_strength": args.stage_2_masked_denoise_strength,
+                    "stage_2_ic_lora_strength": args.stage_2_ic_lora_strength,
+                    "stage_2_conditioning_attention_strength": args.stage_2_conditioning_attention_strength,
                     "video_strength": args.video_strength,
                     "conditioning_attention_strength": args.conditioning_attention_strength,
+                    "no_image_conditioning": args.no_image_conditioning,
                     "image_conditions": [image._asdict() for image in image_conditionings],
                     "reference_image_replace": sorted(reference_image_replace)
                     if reference_image_replace is not None
@@ -467,6 +663,15 @@ def main() -> None:
         )
         print(f"Writing attention probe metrics to {attention_probe.output_path}")
 
+    initial_video_latent = None
+    if args.initial_video_latent:
+        latent_path = Path(args.initial_video_latent).expanduser().resolve()
+        payload = torch.load(latent_path, map_location="cpu")
+        initial_video_latent = payload.get("latent", payload) if isinstance(payload, dict) else payload
+        if not isinstance(initial_video_latent, torch.Tensor):
+            raise TypeError(f"Expected a tensor at {latent_path}, got {type(initial_video_latent)!r}")
+        print(f"Loaded initial Stage 1 latent from {latent_path} with shape {tuple(initial_video_latent.shape)}")
+
     tiling_config = TilingConfig.default()
     video, audio = pipeline(
         prompt=build_prompt(args.prompt, args.negative_prompt),
@@ -477,12 +682,18 @@ def main() -> None:
         frame_rate=frame_rate,
         images=image_conditionings,
         video_conditioning=video_conditioning,
+        correspondence_mask=correspondence_mask,
+        source_correspondence_bias=args.source_correspondence_bias,
+        source_correspondence_radius=args.source_correspondence_radius,
         enhance_prompt=args.enhance_prompt,
+        stage_2_masked_denoise_strength=args.stage_2_masked_denoise_strength,
+        stage_2_conditioning_attention_strength=args.stage_2_conditioning_attention_strength,
         tiling_config=tiling_config,
         conditioning_attention_strength=args.conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         attention_probe=attention_probe,
         reference_image_replace=reference_image_replace,
+        initial_video_latent=initial_video_latent,
         # streaming_prefetch_count=args.streaming_prefetch_count,
     )
 
@@ -504,9 +715,18 @@ def main() -> None:
         f"image conditions={len(image_conditionings)}, "
         f"video conditions={[(p, s) for p, s in video_conditioning]}, "
         f"conditioning mode={args.conditioning_mode}, "
+        f"Stage 2 IC-LoRA strength={args.stage_2_ic_lora_strength}, "
+        f"Stage 2 conditioning attention strength={args.stage_2_conditioning_attention_strength}, "
+        f"no image conditioning={args.no_image_conditioning}, "
         f"reference image replace="
         f"{sorted(reference_image_replace) if reference_image_replace is not None else 'default(0)'}"
     )
+    if args.no_image_conditioning and not args.skip_stage_2:
+        print(
+            "Warning: --no-image-conditioning leaves Stage 2 without an image anchor; "
+            "--skip-stage-2 is usually the safer choice for minimum drift tests."
+        )
+
 
 if __name__ == "__main__":
     torch.set_grad_enabled(False)

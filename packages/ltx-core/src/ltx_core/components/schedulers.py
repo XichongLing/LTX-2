@@ -30,7 +30,10 @@ class LTX2Scheduler(SchedulerProtocol):
         **_kwargs,
     ) -> torch.FloatTensor:
         tokens = math.prod(latent.shape[2:]) if latent is not None else default_number_of_tokens
-        sigmas = torch.linspace(1.0, 0.0, steps + 1)
+        # The token-dependent shift can make sigmas extremely close to one.
+        # Keep schedule construction in float64 so stretching does not collapse
+        # distinct values (or produce NaNs) before the final float32 cast.
+        sigmas = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float64)
 
         x1 = BASE_SHIFT_ANCHOR
         x2 = MAX_SHIFT_ANCHOR
@@ -38,12 +41,10 @@ class LTX2Scheduler(SchedulerProtocol):
         b = base_shift - mm * x1
         sigma_shift = (tokens) * mm + b
 
-        power = 1
-        sigmas = torch.where(
-            sigmas != 0,
-            math.exp(sigma_shift) / (math.exp(sigma_shift) + (1 / sigmas - 1) ** power),
-            0,
-        )
+        interior_mask = (sigmas > 0) & (sigmas < 1)
+        shifted_sigmas = sigmas.clone()
+        shifted_sigmas[interior_mask] = torch.sigmoid(torch.logit(sigmas[interior_mask]) + sigma_shift)
+        sigmas = shifted_sigmas
 
         # Stretch sigmas so that its final value matches the given terminal value.
         if stretch:
@@ -51,6 +52,10 @@ class LTX2Scheduler(SchedulerProtocol):
             non_zero_sigmas = sigmas[non_zero_mask]
             one_minus_z = 1.0 - non_zero_sigmas
             scale_factor = one_minus_z[-1] / (1.0 - terminal)
+            if not torch.isfinite(scale_factor) or scale_factor <= 0:
+                raise ValueError(
+                    "Unable to stretch sigma schedule: token-dependent shift collapsed the non-zero sigma range."
+                )
             stretched = 1.0 - (one_minus_z / scale_factor)
             sigmas[non_zero_mask] = stretched
 

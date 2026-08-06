@@ -171,6 +171,7 @@ def _build_state(
         dtype=dtype,
         device=device,
         noise_scale=spec.noise_scale,
+        denoise_mask=spec.denoise_mask,
         initial_latent=spec.initial_latent,
     )
     if spec.frozen:

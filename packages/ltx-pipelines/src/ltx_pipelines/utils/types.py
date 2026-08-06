@@ -106,6 +106,7 @@ class ModalitySpec:
     context: torch.Tensor
     conditionings: list[ConditioningItem] = field(default_factory=list)
     noise_scale: float = 1.0
+    denoise_mask: torch.Tensor | None = None
     frozen: bool = False
     initial_latent: torch.Tensor | None = None
 
