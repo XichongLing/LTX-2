@@ -54,6 +54,8 @@ def build_style_transfer_command(
         args.gemma_root,
         "--ic-lora-path",
         args.ic_lora_path,
+        "--stage-1-ic-lora-strength",
+        str(getattr(args, "stage_1_ic_lora_strength", 1.0)),
         "--reference-video",
         source_video,
         "--conditioning-video",
@@ -86,7 +88,28 @@ def build_style_transfer_command(
         str(args.source_correspondence_radius),
         "--stage-2-masked-denoise-strength",
         str(args.stage_2_masked_denoise_strength),
+        "--stage-2-noise-mode",
+        getattr(args, "stage_2_noise_mode", "gaussian"),
+        "--stage-2-noise-transform",
+        getattr(args, "stage_2_noise_transform", "spatial"),
+        "--stage-2-noise-mask-mode",
+        getattr(args, "stage_2_noise_mask_mode", "area_fraction"),
+        "--stage-2-noise-area-fraction",
+        str(getattr(args, "stage_2_noise_area_fraction", 0.05)),
+        "--stage-2-noise-alpha",
+        str(getattr(args, "stage_2_noise_alpha", 3)),
+        "--stage-2-noise-gamma",
+        str(getattr(args, "stage_2_noise_gamma", 5.0)),
+        "--stage-2-noise-phase-source",
+        getattr(args, "stage_2_noise_phase_source", "stage1"),
+        "--stage-2-start-sigma",
+        str(getattr(args, "stage_2_start_sigma", 0.909375)),
     ]
+    stage_2_noise_diagnostics = getattr(args, "stage_2_noise_diagnostics", None)
+    if stage_2_noise_diagnostics:
+        command.extend(["--stage-2-noise-diagnostics", stage_2_noise_diagnostics])
+    if getattr(args, "no_source_video_conditioning", False):
+        command.append("--no-source-video-conditioning")
 
     if args.correspondence_mask_file:
         command.extend(["--correspondence-mask-file", args.correspondence_mask_file])
@@ -211,6 +234,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-upsampler-path", required=True)
     parser.add_argument("--gemma-root", required=True)
     parser.add_argument("--ic-lora-path", required=True)
+    parser.add_argument(
+        "--stage-1-ic-lora-strength",
+        type=float,
+        default=1.0,
+        help="Stage-1 IC-LoRA strength. Set to 0 to use only the backbone weights in Stage 1.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--height", type=int, default=None)
@@ -274,8 +303,31 @@ def parse_args() -> argparse.Namespace:
         help="Strength for the edge condition in multi-signal modes. Defaults to --video-strength.",
     )
     parser.add_argument("--conditioning-attention-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--no-source-video-conditioning",
+        action="store_true",
+        help=(
+            "Prepare the usual source/control videos, but do not pass any source video "
+            "conditioning tokens to the IC-LoRA runner."
+        ),
+    )
     parser.add_argument("--stage-2-ic-lora-strength", type=float, default=0.0)
     parser.add_argument("--stage-2-conditioning-attention-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--stage-2-noise-mode",
+        choices=("gaussian", "phi", "raw_reference_coefficients", "matched_reference_coefficients"),
+        default="gaussian",
+    )
+    parser.add_argument("--stage-2-noise-transform", choices=("spatial",), default="spatial")
+    parser.add_argument(
+        "--stage-2-noise-mask-mode", choices=("area_fraction", "official_alpha"), default="area_fraction"
+    )
+    parser.add_argument("--stage-2-noise-area-fraction", type=float, default=0.05)
+    parser.add_argument("--stage-2-noise-alpha", type=int, default=3)
+    parser.add_argument("--stage-2-noise-gamma", type=float, default=5.0)
+    parser.add_argument("--stage-2-noise-phase-source", choices=("stage1",), default="stage1")
+    parser.add_argument("--stage-2-start-sigma", type=float, default=0.909375)
+    parser.add_argument("--stage-2-noise-diagnostics", default=None)
     parser.add_argument("--skip-stage-2", action="store_true")
     parser.add_argument("--enhance-prompt", action="store_true")
     parser.add_argument("--quiet-layer-streaming", action="store_true")

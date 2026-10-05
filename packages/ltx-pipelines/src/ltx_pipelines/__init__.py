@@ -19,18 +19,30 @@ from ltx_pipelines.ic_lora import ICLoraPipeline
 from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.lipdub import LipDubPipeline
 from ltx_pipelines.retake import RetakePipeline
+from ltx_pipelines.stage2_noise import (
+    Stage2NoiseConfig,
+    Stage2NoiseMaskMode,
+    Stage2NoiseMode,
+    Stage2NoisePhaseSource,
+    Stage2NoiseTransform,
+)
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
 __all__ = [
     "A2VidPipelineTwoStage",
     "DistilledPipeline",
-    "FlowEditPipeline",
     "EditFlowPipeline",
+    "FlowEditPipeline",
     "ICLoraPipeline",
     "KeyframeInterpolationPipeline",
     "LipDubPipeline",
     "RetakePipeline",
+    "Stage2NoiseConfig",
+    "Stage2NoiseMaskMode",
+    "Stage2NoiseMode",
+    "Stage2NoisePhaseSource",
+    "Stage2NoiseTransform",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
 ]

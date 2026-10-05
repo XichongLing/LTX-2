@@ -59,6 +59,8 @@ class _StageLayout:
     first_frame_token_count: int
     tokens_per_frame: int
     target_latent_frames: int
+    reference_item_names: tuple[str, ...]
+    reference_item_ranges: tuple[tuple[int, int], ...]
 
 
 class AttentionProbe:
@@ -99,6 +101,8 @@ class AttentionProbe:
         height: int,
         frames: int,
         fps: float,
+        reference_token_counts: tuple[int, ...] | None = None,
+        reference_item_names: tuple[str, ...] | None = None,
     ):
         pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
         target_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
@@ -112,7 +116,7 @@ class AttentionProbe:
             denoiser,
         ) -> tuple[LatentState | None, LatentState | None]:
             if video_state is not None:
-                self._configure_stage(stage=stage, target_shape=target_shape, video_state=video_state)
+                self._configure_stage(stage=stage, target_shape=target_shape, video_state=video_state, reference_token_counts=reference_token_counts, reference_item_names=reference_item_names)
                 self.patch_transformer(transformer)
 
             try:
@@ -151,6 +155,11 @@ class AttentionProbe:
                 continue
             attention.attention_function = _ProbedAttentionCallable(
                 original=attention.attention_function,
+                probe=self,
+                layer_idx=layer_idx,
+            )
+            attention.masked_attention_function = _ProbedAttentionCallable(
+                original=attention.masked_attention_function,
                 probe=self,
                 layer_idx=layer_idx,
             )
@@ -194,6 +203,8 @@ class AttentionProbe:
         target_first_sum = torch.zeros(heads, device=device, dtype=torch.float64)
         future_first_sum = torch.zeros(heads, device=device, dtype=torch.float64)
         ref_value_norm_sum = torch.zeros(heads, device=device, dtype=torch.float64)
+        item_ref_sums = torch.zeros(heads, len(layout.reference_item_ranges), device=device, dtype=torch.float64)
+        item_value_norm_sums = torch.zeros_like(item_ref_sums)
         first_value_norm_sum = torch.zeros(heads, device=device, dtype=torch.float64)
         total_value_norm_sum = torch.zeros(heads, device=device, dtype=torch.float64)
         frame_ref_sums = torch.zeros(heads, layout.target_latent_frames, device=device, dtype=torch.float64)
@@ -220,6 +231,13 @@ class AttentionProbe:
                 target_ref_sum += ref_probs.sum(dim=(0, 2, 3), dtype=torch.float64)
                 ref_out = torch.matmul(ref_probs, v_heads[:, :, ref_start:, :])
                 ref_value_norm_sum += ref_out.norm(dim=-1).sum(dim=(0, 2), dtype=torch.float64)
+                for item_index, (item_start, item_stop) in enumerate(layout.reference_item_ranges):
+                    item_probs = probs[..., item_start:item_stop]
+                    item_ref_sums[:, item_index] += item_probs.sum(dim=(0, 2, 3), dtype=torch.float64)
+                    item_out = torch.matmul(item_probs, v_heads[:, :, item_start:item_stop, :])
+                    item_value_norm_sums[:, item_index] += item_out.norm(dim=-1).sum(
+                        dim=(0, 2), dtype=torch.float64
+                    )
 
             if first_count > 0:
                 first_probs = probs[..., :first_count]
@@ -276,6 +294,12 @@ class AttentionProbe:
         target_first_mass = _safe_div_tensor(target_first_sum, target_denom) if first_count > 0 else None
         future_first_mass = _safe_div_tensor(future_first_sum, future_denom) if future_denom > 0 else None
         ref_value_ratio = _safe_div_tensor(ref_value_norm_sum, total_value_norm_sum) if ref_count > 0 else None
+        item_ref_mass = _safe_div_tensor(item_ref_sums, target_denom) if ref_count > 0 else None
+        item_value_ratio = (
+            item_value_norm_sums / total_value_norm_sum.clamp_min(1e-12).unsqueeze(1)
+            if ref_count > 0
+            else None
+        )
         first_value_ratio = _safe_div_tensor(first_value_norm_sum, total_value_norm_sum) if first_count > 0 else None
 
         frame_ref_mass = None
@@ -289,9 +313,11 @@ class AttentionProbe:
                     {
                         "head": head_idx,
                         "target_to_ref_video_mass": _tensor_item(target_ref_mass, head_idx),
+                        "target_to_ref_mass_by_item": _tensor_list(item_ref_mass, head_idx),
                         "target_to_first_frame_mass": _tensor_item(target_first_mass, head_idx),
                         "future_target_to_first_frame_mass": _tensor_item(future_first_mass, head_idx),
                         "ref_video_value_contribution_ratio": _tensor_item(ref_value_ratio, head_idx),
+                        "ref_value_contribution_ratio_by_item": _tensor_list(item_value_ratio, head_idx),
                         "first_frame_value_contribution_ratio": _tensor_item(first_value_ratio, head_idx),
                         "target_frame_to_ref_video_mass": _tensor_list(frame_ref_mass, head_idx),
                     }
@@ -303,9 +329,11 @@ class AttentionProbe:
                 {
                     "head": "mean",
                     "target_to_ref_video_mass": _tensor_mean(target_ref_mass),
+                    "target_to_ref_mass_by_item": _tensor_mean_list(item_ref_mass),
                     "target_to_first_frame_mass": _tensor_mean(target_first_mass),
                     "future_target_to_first_frame_mass": _tensor_mean(future_first_mass),
                     "ref_video_value_contribution_ratio": _tensor_mean(ref_value_ratio),
+                    "ref_value_contribution_ratio_by_item": _tensor_mean_list(item_value_ratio),
                     "first_frame_value_contribution_ratio": _tensor_mean(first_value_ratio),
                     "target_frame_to_ref_video_mass": _tensor_mean_list(frame_ref_mass),
                 }
@@ -318,19 +346,39 @@ class AttentionProbe:
         stage: int,
         target_shape: VideoLatentShape,
         video_state: LatentState,
+        reference_token_counts: tuple[int, ...] | None = None,
+        reference_item_names: tuple[str, ...] | None = None,
     ) -> None:
         target_count = target_shape.token_count()
         total_count = video_state.latent.shape[1]
         tokens_per_frame = target_shape.height * target_shape.width
+        reference_count = max(0, total_count - target_count)
+        if reference_token_counts is None:
+            reference_token_counts = (reference_count,) if reference_count else ()
+        if sum(reference_token_counts) != reference_count:
+            raise ValueError(
+                f"reference token counts {reference_token_counts} do not sum to appended count {reference_count}"
+            )
+        if reference_item_names is None:
+            reference_item_names = tuple(f"reference_{index}" for index in range(len(reference_token_counts)))
+        if len(reference_item_names) != len(reference_token_counts):
+            raise ValueError("reference item names must match reference token counts")
+        range_start = target_count
+        item_ranges = []
+        for count in reference_token_counts:
+            item_ranges.append((range_start, range_start + count))
+            range_start += count
         layout = _StageLayout(
             stage=stage,
             target_token_count=target_count,
             total_token_count=total_count,
             reference_token_start=min(target_count, total_count),
-            reference_token_count=max(0, total_count - target_count),
+            reference_token_count=reference_count,
             first_frame_token_count=tokens_per_frame,
             tokens_per_frame=tokens_per_frame,
             target_latent_frames=target_shape.frames,
+            reference_item_names=reference_item_names,
+            reference_item_ranges=tuple(item_ranges),
         )
         self._layout = layout
         self._write_json(
@@ -344,6 +392,8 @@ class AttentionProbe:
                 "first_frame_token_count": layout.first_frame_token_count,
                 "tokens_per_frame": layout.tokens_per_frame,
                 "target_latent_frames": layout.target_latent_frames,
+                "reference_item_names": list(layout.reference_item_names),
+                "reference_item_ranges": [list(value) for value in layout.reference_item_ranges],
             }
         )
 
@@ -357,6 +407,8 @@ class AttentionProbe:
     ) -> LatentState | None:
         if state is None or denoised is None:
             return state
+        if hasattr(denoised, "denoised"):
+            denoised = denoised.denoised
         denoised = post_process_latent(denoised, state.denoise_mask, state.clean_latent)
         from dataclasses import replace
 
@@ -383,6 +435,11 @@ class _ProbedAttentionCallable:
     ) -> torch.Tensor:
         if self.probe.should_probe(self.layer_idx):
             self.probe.collect(layer_idx=self.layer_idx, q=q, k=k, v=v, heads=heads, mask=mask)
+        if mask is None:
+            try:
+                return self.original(q, k, v, heads)
+            except TypeError:
+                return self.original(q, k, v, heads, mask)
         return self.original(q, k, v, heads, mask)
 
 

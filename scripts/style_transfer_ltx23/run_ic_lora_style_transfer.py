@@ -25,7 +25,15 @@ for src_dir in PACKAGE_SRC_DIRS:
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_pipelines import ICLoraPipeline
+from ltx_pipelines.reference_partition import Stage1ReferencePartitionConfig
+from ltx_pipelines.stage2_noise import (
+    Stage2NoiseBundle,
+    Stage2NoiseConfig,
+    load_stage2_noise_bundle,
+    save_stage2_noise_bundle,
+)
 from ltx_pipelines.stage2_routing import load_stage2_input_cache
+from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMAS
 from ltx_pipelines.correspondence_mask import (
     CorrespondenceMaskBox,
     build_box_mask,
@@ -85,6 +93,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spatial-upsampler-path", required=True, help="Path to the spatial upsampler checkpoint.")
     parser.add_argument("--gemma-root", required=True, help="Path to the Gemma text-encoder directory.")
     parser.add_argument("--ic-lora-path", required=True, help="Path to the IC-LoRA weights.")
+    parser.add_argument(
+        "--stage-1-ic-lora-strength",
+        type=float,
+        default=1.0,
+        help="Stage-1 IC-LoRA strength. Set to 0 to load only the backbone weights in Stage 1.",
+    )
+    parser.add_argument(
+        "--reference-downscale-factor-override",
+        type=int,
+        default=None,
+        help=(
+            "Experiment-only override for IC-LoRA reference video downscale factor. "
+            "Defaults to the value stored in LoRA metadata."
+        ),
+    )
+    parser.add_argument(
+        "--ref-position-quantize",
+        type=int,
+        default=None,
+        help="Phase-2c: keep full-resolution reference tokens but gather q-downscaled/coarse RoPE positions.",
+    )
+    parser.add_argument(
+        "--ref-token-stride",
+        type=int,
+        default=None,
+        help="Phase-2c: keep only top-left full-resolution reference tokens every q spatial token cells.",
+    )
+    parser.add_argument(
+        "--ref-positions-log",
+        default=None,
+        help="Optional JSON path for resolved Phase-2c reference token/position diagnostics.",
+    )
+    parser.add_argument(
+        "--ref-partition-config",
+        default=None,
+        help="Experimental Stage-1-only JSON config for masked multi-scale reference tokens.",
+    )
     parser.add_argument(
         "--reference-video", required=True, help="Reference video whose motion and camera should be followed."
     )
@@ -230,6 +275,14 @@ def parse_args() -> argparse.Namespace:
         help="How strongly the reference video conditioning should influence attention, in [0, 1].",
     )
     parser.add_argument(
+        "--no-source-video-conditioning",
+        action="store_true",
+        help=(
+            "Do not append source/control video latents as IC-LoRA reference tokens. "
+            "Image conditioning is still applied."
+        ),
+    )
+    parser.add_argument(
         "--source-strength-schedule",
         choices=("constant", "values", "sigma-ramp"),
         default="constant",
@@ -338,8 +391,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help=(
-            "IC-LoRA adapter strength in Stage 2. Zero preserves the previous image-only Stage 2; "
-            "a positive value also appends the source-video reference tokens in Stage 2."
+            "IC-LoRA adapter strength in Stage 2. Controlled modes still append requested source-video tokens "
+            "at zero strength, allowing a base-transformer source-token ablation."
         ),
     )
     parser.add_argument(
@@ -350,9 +403,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage-2-branch-mode",
-        choices=("legacy", "image", "video", "global", "spatial"),
+        choices=("legacy", "image", "video", "global", "spatial", "dual"),
         default="legacy",
         help="Stage-2 branch execution mode. Legacy preserves the existing pre-fused path.",
+    )
+    parser.add_argument(
+        "--stage-2-lora-execution",
+        choices=("auto", "fused", "runtime"),
+        default="auto",
+        help="Experiment control for Stage-2 IC-LoRA execution; auto preserves existing behavior.",
     )
     parser.add_argument(
         "--stage-2-video-mix",
@@ -378,9 +437,161 @@ def parse_args() -> argparse.Namespace:
         help="Independent Stage-2 noise seed. Defaults to --seed.",
     )
     parser.add_argument(
+        "--stage-2-noise-mode",
+        choices=("gaussian", "phi", "raw_reference_coefficients", "matched_reference_coefficients"),
+        default="gaussian",
+        help="Stage-2 target-video initialization noise mode.",
+    )
+    parser.add_argument(
+        "--stage-2-noise-transform",
+        choices=("spatial",),
+        default="spatial",
+        help="FFT transform used for manipulated Stage-2 video noise (v1: spatial only).",
+    )
+    parser.add_argument(
+        "--stage-2-noise-mask-mode",
+        choices=("area_fraction", "official_alpha"),
+        default="area_fraction",
+        help="Low-frequency mask parameterization.",
+    )
+    parser.add_argument("--stage-2-noise-area-fraction", type=float, default=0.05)
+    parser.add_argument("--stage-2-noise-alpha", type=int, default=3)
+    parser.add_argument("--stage-2-noise-gamma", type=float, default=5.0)
+    parser.add_argument(
+        "--stage-2-noise-phase-source", choices=("stage1",), default="stage1"
+    )
+    parser.add_argument(
+        "--stage-2-start-sigma",
+        type=float,
+        default=float(STAGE_2_DISTILLED_SIGMAS[0]),
+        help="Stage-2 starting sigma; 0.8 enables the lower-noise SDEdit control with a truncated schedule.",
+    )
+    parser.add_argument(
+        "--stage-2-noise-diagnostics",
+        default=None,
+        help="Optional JSON path for initialization diagnostics.",
+    )
+    parser.add_argument("--stage-2-noise-bundle-load", default=None)
+    parser.add_argument("--stage-2-noise-bundle-save", default=None)
+    parser.add_argument(
         "--stage-2-prediction-dir",
         default=None,
         help="Optional directory for per-step image/video/routed X0 safetensors and metrics.",
+    )
+    parser.add_argument(
+        "--stage-2-dual-image-ic-lora",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Enable runtime IC-LoRA on the dual editable branch. Source-video tokens are absent by default "
+            "and present with --stage-2-reference-edit-conditioning video. Defaults to enabled in dual mode."
+        ),
+    )
+    parser.add_argument(
+        "--stage-2-kv-include-inside-mask",
+        action="store_true",
+        help="Experimental alias for --stage-2-kv-anchor-region all.",
+    )
+    parser.add_argument(
+        "--stage-2-kv-anchor-region",
+        choices=("outside", "inside", "all"),
+        default="outside",
+        help="Which video-anchor target K/V tokens to append or mix for dual Stage-2 KV guidance.",
+    )
+    parser.add_argument(
+        "--stage-2-kv-mode",
+        choices=("none", "partition", "append"),
+        default="none",
+        help="Dress-query KV guidance used by dual Stage-2 routing.",
+    )
+    parser.add_argument(
+        "--stage-2-kv-strength",
+        type=float,
+        default=1.0,
+        help="Fixed video-anchor KV strength in [0,1].",
+    )
+    parser.add_argument(
+        "--stage-2-kv-layers",
+        default="all",
+        help="Comma/range layer specification for Stage-2 KV guidance, or 'all'.",
+    )
+    parser.add_argument(
+        "--stage-2-kv-cache-backend",
+        choices=("cpu", "disk"),
+        default="cpu",
+        help="Current-step K/V offload backend.",
+    )
+    parser.add_argument(
+        "--stage-2-kv-cache-dir",
+        default=None,
+        help="Temporary per-layer safetensors directory required by the disk KV backend.",
+    )
+    parser.add_argument(
+        "--stage-2-appearance-reference",
+        default=None,
+        help="Unaligned appearance-reference image used by Stage-2 reference attention.",
+    )
+    parser.add_argument(
+        "--stage-2-appearance-reference-video",
+        default=None,
+        help="Appearance-reference video used by Stage-2 reference attention; mutually exclusive with the image input.",
+    )
+    parser.add_argument(
+        "--stage-2-appearance-reference-mask",
+        default=None,
+        help="Binary or soft mask selecting appearance tokens in the reference image.",
+    )
+    parser.add_argument(
+        "--stage-2-reference-attention-mode",
+        choices=(
+            "none",
+            "blend",
+            "replace",
+            "concat",
+            "source-qk-reference-v",
+            "source-q-reference-kv",
+        ),
+        default="none",
+        help=(
+            "Masked reference attention used by the dual hybrid branch. "
+            "source-qk-reference-v uses anchor attention routing with reference values; "
+            "source-q-reference-kv uses anchor queries with reference keys and values."
+        ),
+    )
+    parser.add_argument(
+        "--stage-2-reference-position-mode",
+        choices=("pre-rope", "post-rope", "q-post-k-pre"),
+        default="pre-rope",
+        help="Position space used for masked reference Q/K attention. Existing behavior is pre-rope.",
+    )
+    parser.add_argument(
+        "--stage-2-reference-kv-strength",
+        type=float,
+        default=None,
+        help=(
+            "Reference guidance strength in [0,1]. Blend interpolates outputs; concat adds log(strength) "
+            "to appended reference logits (default: 0.5 for blend/concat, 1 for pure modes)."
+        ),
+    )
+    parser.add_argument(
+        "--stage-2-reference-kv-layers",
+        default="all",
+        help="Comma/range layer specification for Stage-2 reference attention, or 'all'.",
+    )
+    parser.add_argument(
+        "--stage-2-reference-noise-seed",
+        type=int,
+        default=None,
+        help="Independent reference-trajectory noise seed. Defaults to Stage-2 noise seed plus 3.",
+    )
+    parser.add_argument(
+        "--stage-2-reference-edit-conditioning",
+        choices=("none", "video"),
+        default="none",
+        help=(
+            "Conditioning for the editable dual trajectory during reference attention. "
+            "'video' clones the anchor's source-video tokens but keeps independent target/audio updates."
+        ),
     )
     parser.add_argument(
         "--correspondence-mask-mode",
@@ -505,6 +716,11 @@ def parse_args() -> argparse.Namespace:
         "--load-stage-2-input",
         default=None,
         help="Load a validated Stage-2 input cache and skip Stage 1.",
+    )
+    parser.add_argument(
+        "--load-stage-2-input-ignore-metadata",
+        action="store_true",
+        help="Experiment-only: validate cache tensors/checksums but skip Stage-1 fingerprint matching.",
     )
     parser.add_argument(
         "--initial-video-latent",
@@ -682,6 +898,7 @@ def build_stage_2_cache_metadata(
         "num_frames": num_frames,
         "frame_rate": frame_rate,
         "checkpoint": _asset_signature(args.distilled_checkpoint_path),
+        "spatial_upsampler": _asset_signature(args.spatial_upsampler_path),
         "ic_lora": _asset_signature(args.ic_lora_path),
         "reference_video": _asset_signature(args.reference_video),
         "video_conditioning": [
@@ -697,6 +914,8 @@ def build_stage_2_cache_metadata(
             for item in image_conditionings
         ],
         "conditioning_attention_strength": args.conditioning_attention_strength,
+        "no_source_video_conditioning": args.no_source_video_conditioning,
+        "stage_1_ic_lora_strength": args.stage_1_ic_lora_strength,
         "source_strength": (
             {"schedule": "constant", "constant": 1.0, "routing": args.source_strength_routing}
             if args.stage_2_branch_mode != "legacy"
@@ -728,6 +947,40 @@ def build_stage_2_cache_metadata(
 def main() -> None:
     args = parse_args()
 
+    stage_2_noise_diagnostics: list[dict[str, object]] = []
+    if args.stage_2_noise_bundle_load and args.stage_2_noise_bundle_save:
+        raise ValueError("Stage-2 noise bundle load and save are mutually exclusive")
+    stage_2_noise_bundle = (
+        load_stage2_noise_bundle(args.stage_2_noise_bundle_load)
+        if args.stage_2_noise_bundle_load
+        else Stage2NoiseBundle(
+            provenance={
+                "seed": args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed,
+                "branch_mode": args.stage_2_branch_mode,
+            }
+        )
+        if args.stage_2_noise_bundle_save
+        else None
+    )
+    stage_2_noise_config = Stage2NoiseConfig(
+        mode=args.stage_2_noise_mode,
+        transform=args.stage_2_noise_transform,
+        mask_mode=args.stage_2_noise_mask_mode,
+        area_fraction=args.stage_2_noise_area_fraction,
+        alpha=args.stage_2_noise_alpha,
+        gamma=args.stage_2_noise_gamma,
+        phase_source=args.stage_2_noise_phase_source,
+        diagnostics_sink=stage_2_noise_diagnostics,
+        noise_bundle=stage_2_noise_bundle,
+    )
+    if not float(STAGE_2_DISTILLED_SIGMAS[1]) < args.stage_2_start_sigma <= 1.0:
+        raise ValueError(
+            "--stage-2-start-sigma must be greater than the next existing Stage-2 sigma "
+            f"({float(STAGE_2_DISTILLED_SIGMAS[1])}) and at most 1.0."
+        )
+    stage_2_sigmas = STAGE_2_DISTILLED_SIGMAS.clone()
+    stage_2_sigmas[0] = args.stage_2_start_sigma
+
     if args.quiet_layer_streaming:
         logging.getLogger("ltx_core.layer_streaming").setLevel(logging.ERROR)
 
@@ -748,6 +1001,29 @@ def main() -> None:
         raise ValueError("num_frames must be positive.")
     if not (0.0 <= args.conditioning_attention_strength <= 1.0):
         raise ValueError("conditioning_attention_strength must be between 0.0 and 1.0.")
+    if args.ref_position_quantize is not None and args.ref_token_stride is not None:
+        raise ValueError("--ref-position-quantize and --ref-token-stride are mutually exclusive.")
+    for label, value in (
+        ("--ref-position-quantize", args.ref_position_quantize),
+        ("--ref-token-stride", args.ref_token_stride),
+    ):
+        if value is not None and value < 1:
+            raise ValueError(f"{label} must be a positive integer.")
+    if (args.ref_position_quantize is not None or args.ref_token_stride is not None) and (
+        args.reference_downscale_factor_override != 1
+    ):
+        raise ValueError(
+            "Phase-2c reference token/position controls require --reference-downscale-factor-override 1."
+        )
+    if args.ref_partition_config is not None and (
+        args.ref_position_quantize is not None or args.ref_token_stride is not None
+    ):
+        raise ValueError("--ref-partition-config cannot be combined with ref position or stride controls")
+    stage_1_ref_partition_config = (
+        Stage1ReferencePartitionConfig.load(args.ref_partition_config)
+        if args.ref_partition_config is not None
+        else None
+    )
     source_strength_values = (
         parse_source_strength_values(args.source_strength_values) if args.source_strength_values is not None else None
     )
@@ -783,25 +1059,83 @@ def main() -> None:
     if args.stage_2_ic_lora_strength < 0.0:
         raise ValueError("--stage-2-ic-lora-strength must be non-negative.")
     controlled_stage_2 = args.stage_2_branch_mode != "legacy"
+    if args.stage_2_dual_image_ic_lora is None:
+        args.stage_2_dual_image_ic_lora = args.stage_2_branch_mode == "dual"
     if controlled_stage_2 and args.skip_stage_2:
         raise ValueError("controlled Stage-2 branch modes cannot be combined with --skip-stage-2.")
     if not 0.0 <= args.stage_2_video_mix <= 1.0:
         raise ValueError("--stage-2-video-mix must be between 0.0 and 1.0.")
-    if args.stage_2_branch_mode == "spatial":
+    if args.stage_2_branch_mode in {"spatial", "dual"}:
         if args.stage_2_routing_mask is None:
-            raise ValueError("--stage-2-routing-mask is required for spatial routing.")
+            raise ValueError("--stage-2-routing-mask is required for spatial and dual routing.")
         if args.stage_2_dress_video_contribution is None or not 0.0 <= args.stage_2_dress_video_contribution <= 1.0:
             raise ValueError("--stage-2-dress-video-contribution must be between 0.0 and 1.0.")
     elif args.stage_2_routing_mask is not None:
-        raise ValueError("--stage-2-routing-mask is only valid with --stage-2-branch-mode spatial.")
-    if args.stage_2_branch_mode in {"video", "global", "spatial"} and args.stage_2_ic_lora_strength <= 0.0:
-        raise ValueError("video-bearing controlled Stage-2 modes require --stage-2-ic-lora-strength > 0.")
+        raise ValueError("--stage-2-routing-mask is only valid with spatial or dual Stage-2 routing.")
+    if args.stage_2_branch_mode != "dual" and args.stage_2_kv_mode != "none":
+        raise ValueError("--stage-2-kv-mode is only valid with --stage-2-branch-mode dual.")
+    if args.stage_2_branch_mode != "dual" and args.stage_2_dual_image_ic_lora:
+        raise ValueError("--stage-2-dual-image-ic-lora is only valid with --stage-2-branch-mode dual.")
+    if args.stage_2_kv_include_inside_mask:
+        args.stage_2_kv_anchor_region = "all"
+    if args.stage_2_branch_mode != "dual" and args.stage_2_kv_include_inside_mask:
+        raise ValueError("--stage-2-kv-include-inside-mask is only valid with --stage-2-branch-mode dual.")
+    if args.stage_2_branch_mode != "dual" and args.stage_2_kv_anchor_region != "outside":
+        raise ValueError("--stage-2-kv-anchor-region is only valid with --stage-2-branch-mode dual.")
+    if not 0.0 <= args.stage_2_kv_strength <= 1.0:
+        raise ValueError("--stage-2-kv-strength must be between 0.0 and 1.0.")
+    if args.stage_2_kv_cache_backend == "disk" and args.stage_2_kv_cache_dir is None:
+        raise ValueError("--stage-2-kv-cache-dir is required with the disk KV cache backend.")
+    reference_assets = [args.stage_2_appearance_reference, args.stage_2_appearance_reference_video]
+    if sum(asset is not None for asset in reference_assets) > 1:
+        raise ValueError("Stage-2 appearance reference image and video are mutually exclusive.")
+    reference_asset = next((asset for asset in reference_assets if asset is not None), None)
+    if (reference_asset is None) != (args.stage_2_appearance_reference_mask is None):
+        raise ValueError("A Stage-2 appearance reference image or video and its mask must be provided together.")
+    reference_attention_enabled = args.stage_2_reference_attention_mode != "none"
+    if args.stage_2_reference_kv_strength is None:
+        args.stage_2_reference_kv_strength = (
+            1.0
+            if args.stage_2_reference_attention_mode
+            in {"replace", "source-qk-reference-v", "source-q-reference-kv"}
+            else 0.5
+        )
+    if reference_attention_enabled and args.stage_2_branch_mode != "dual":
+        raise ValueError("Stage-2 reference attention is only valid with --stage-2-branch-mode dual.")
+    if reference_attention_enabled and reference_asset is None:
+        raise ValueError("Stage-2 reference attention requires an appearance reference image and mask.")
+    if reference_attention_enabled and args.stage_2_kv_mode != "none":
+        raise ValueError("Reference attention cannot be combined with video-anchor --stage-2-kv-mode.")
+    if not 0.0 <= args.stage_2_reference_kv_strength <= 1.0:
+        raise ValueError("--stage-2-reference-kv-strength must be between 0.0 and 1.0.")
+    if (
+        args.stage_2_reference_attention_mode
+        in {"replace", "source-qk-reference-v", "source-q-reference-kv"}
+        and args.stage_2_reference_kv_strength != 1.0
+    ):
+        raise ValueError(
+            f"Reference {args.stage_2_reference_attention_mode} mode requires "
+            "--stage-2-reference-kv-strength 1."
+        )
+    if not reference_attention_enabled and reference_asset is not None:
+        raise ValueError("Appearance reference inputs require a non-none reference attention mode.")
     if controlled_stage_2 and args.attention_probe_output:
         raise ValueError("--attention-probe-output is not yet supported with controlled Stage-2 modes.")
     if not 0.0 <= args.stage_2_conditioning_attention_strength <= 1.0:
         raise ValueError("--stage-2-conditioning-attention-strength must be between 0.0 and 1.0.")
     if args.skip_stage_2 and args.stage_2_ic_lora_strength > 0.0:
         raise ValueError("--stage-2-ic-lora-strength has no effect with --skip-stage-2.")
+    if args.no_source_video_conditioning:
+        if controlled_stage_2 and args.stage_2_branch_mode not in {"image"}:
+            raise ValueError(
+                "--no-source-video-conditioning is only compatible with legacy/image Stage-2 branch modes."
+            )
+        if args.stage_2_ic_lora_strength > 0.0:
+            raise ValueError("--stage-2-ic-lora-strength requires source video conditioning.")
+        if args.source_correspondence_bias > 0.0:
+            raise ValueError("--source-correspondence-bias requires source video conditioning.")
+    if args.stage_1_ic_lora_strength < 0.0:
+        raise ValueError("--stage-1-ic-lora-strength must be non-negative.")
     if args.save_stage_2_input and args.load_stage_2_input:
         raise ValueError("--save-stage-2-input and --load-stage-2-input are mutually exclusive.")
     if args.skip_stage_2 and (args.save_stage_2_input or args.load_stage_2_input):
@@ -841,7 +1175,7 @@ def main() -> None:
 
     lora = LoraPathStrengthAndSDOps(
         path=str(Path(args.ic_lora_path).expanduser().resolve()),
-        strength=1.0,
+        strength=args.stage_1_ic_lora_strength,
         sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
     )
     stage_2_loras = []
@@ -852,12 +1186,21 @@ def main() -> None:
             strength=args.stage_2_ic_lora_strength,
             sd_ops=LTXV_LORA_COMFY_RENAMING_MAP,
         )
-        if controlled_stage_2:
+        lora_execution = args.stage_2_lora_execution
+        if lora_execution == "auto":
+            lora_execution = "runtime" if controlled_stage_2 else "fused"
+        if lora_execution == "fused" and controlled_stage_2 and args.stage_2_branch_mode != "video":
+            raise ValueError("Fused Stage-2 LoRA control is only supported by legacy or routed video mode")
+        if lora_execution == "runtime":
             stage_2_runtime_loras.append(stage_2_adapter)
         else:
             stage_2_loras.append(stage_2_adapter)
 
-    video_conditioning = resolve_conditioning_videos(args)
+    if args.no_source_video_conditioning:
+        video_conditioning = []
+        print("Source video conditioning disabled; only image/text conditioning will be passed to the pipeline.")
+    else:
+        video_conditioning = resolve_conditioning_videos(args)
 
     stage_2_routing_mask = None
     if args.stage_2_routing_mask is not None:
@@ -868,6 +1211,25 @@ def main() -> None:
             width=width,
         )
         print(f"Using preprocessed Stage-2 routing mask: {Path(args.stage_2_routing_mask).expanduser().resolve()}")
+
+    stage_2_appearance_reference_mask = None
+    if args.stage_2_appearance_reference_mask is not None:
+        reference_path = Path(
+            args.stage_2_appearance_reference_video or args.stage_2_appearance_reference
+        ).expanduser().resolve()
+        if not reference_path.is_file():
+            raise FileNotFoundError(f"Stage-2 appearance reference does not exist: {reference_path}")
+        stage_2_appearance_reference_mask = load_file_mask(
+            path=args.stage_2_appearance_reference_mask,
+            num_frames=(num_frames if args.stage_2_appearance_reference_video else 1),
+            height=height,
+            width=width,
+        )
+        print(f"Using Stage-2 appearance reference: {reference_path}")
+        print(
+            "Using preprocessed Stage-2 appearance reference mask: "
+            f"{Path(args.stage_2_appearance_reference_mask).expanduser().resolve()}"
+        )
 
     correspondence_mask = None
     if args.source_correspondence_bias > 0.0 or args.stage_2_masked_denoise_strength < 1.0:
@@ -907,11 +1269,12 @@ def main() -> None:
         distilled_checkpoint_path=str(Path(args.distilled_checkpoint_path).expanduser().resolve()),
         spatial_upsampler_path=str(Path(args.spatial_upsampler_path).expanduser().resolve()),
         gemma_root=str(Path(args.gemma_root).expanduser().resolve()),
-        loras=[lora],
+        loras=[lora] if args.stage_1_ic_lora_strength > 0.0 else [],
         stage_2_loras=stage_2_loras,
         stage_2_runtime_loras=stage_2_runtime_loras,
         device=torch.device("cuda"),
         quantization=args.quantization,
+        reference_downscale_factor_override=args.reference_downscale_factor_override,
     )
 
     attention_probe = None
@@ -946,6 +1309,7 @@ def main() -> None:
                     "stage_2_noise_seed": args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed,
                     "video_strength": args.video_strength,
                     "conditioning_attention_strength": args.conditioning_attention_strength,
+                    "no_source_video_conditioning": args.no_source_video_conditioning,
                     "source_strength_schedule": args.source_strength_schedule,
                     "source_strength": args.source_strength,
                     "source_strength_values": list(source_strength_values) if source_strength_values else None,
@@ -954,6 +1318,10 @@ def main() -> None:
                     "source_strength_fade_start_sigma": args.source_strength_fade_start_sigma,
                     "source_strength_fade_end_sigma": args.source_strength_fade_end_sigma,
                     "source_strength_routing": args.source_strength_routing,
+                    "ref_position_quantize": args.ref_position_quantize,
+                    "ref_token_stride": args.ref_token_stride,
+                    "ref_positions_log": args.ref_positions_log,
+                    "ref_partition_config": args.ref_partition_config,
                     "first_frame_attention_schedule": args.first_frame_attention_schedule,
                     "first_frame_attention_multiplier": args.first_frame_attention_multiplier,
                     "first_frame_attention_values": list(first_frame_attention_values)
@@ -1006,7 +1374,7 @@ def main() -> None:
     if args.load_stage_2_input:
         cached_stage_2_video_latent, cached_stage_2_audio_latent, cache_manifest = load_stage2_input_cache(
             args.load_stage_2_input,
-            expected_metadata=stage_2_cache_metadata,
+            expected_metadata=None if args.load_stage_2_input_ignore_metadata else stage_2_cache_metadata,
         )
         print(
             "Loaded verified Stage-2 input cache "
@@ -1040,6 +1408,10 @@ def main() -> None:
         stage_2_source_strength_schedule=source_strength_schedule,
         source_strength_routing=SourceStrengthRouting(args.source_strength_routing),
         source_strength_log=source_strength_log,
+        ref_position_quantize=args.ref_position_quantize,
+        ref_token_stride=args.ref_token_stride,
+        ref_positions_log=args.ref_positions_log,
+        stage_1_ref_partition_config=stage_1_ref_partition_config,
         first_frame_attention_schedule=first_frame_attention_schedule,
         first_frame_attention_log=first_frame_attention_log,
         stage_2_branch_mode=args.stage_2_branch_mode,
@@ -1047,13 +1419,35 @@ def main() -> None:
         stage_2_routing_mask=stage_2_routing_mask,
         stage_2_dress_video_contribution=args.stage_2_dress_video_contribution,
         stage_2_noise_seed=args.stage_2_noise_seed,
+        stage_2_noise_config=stage_2_noise_config,
+        stage_2_sigmas=stage_2_sigmas,
         stage_2_prediction_dir=args.stage_2_prediction_dir,
+        stage_2_kv_mode=args.stage_2_kv_mode,
+        stage_2_dual_image_ic_lora=args.stage_2_dual_image_ic_lora,
+        stage_2_kv_include_inside_mask=args.stage_2_kv_include_inside_mask,
+        stage_2_kv_anchor_region=args.stage_2_kv_anchor_region,
+        stage_2_kv_strength=args.stage_2_kv_strength,
+        stage_2_kv_layers=args.stage_2_kv_layers,
+        stage_2_kv_cache_backend=args.stage_2_kv_cache_backend,
+        stage_2_kv_cache_dir=args.stage_2_kv_cache_dir,
+        stage_2_appearance_reference=args.stage_2_appearance_reference,
+        stage_2_appearance_reference_video=args.stage_2_appearance_reference_video,
+        stage_2_appearance_reference_mask=stage_2_appearance_reference_mask,
+        stage_2_reference_attention_mode=args.stage_2_reference_attention_mode,
+        stage_2_reference_position_mode=args.stage_2_reference_position_mode,
+        stage_2_reference_kv_strength=args.stage_2_reference_kv_strength,
+        stage_2_reference_kv_layers=args.stage_2_reference_kv_layers,
+        stage_2_reference_noise_seed=args.stage_2_reference_noise_seed,
+        stage_2_reference_edit_conditioning=args.stage_2_reference_edit_conditioning,
         cached_stage_2_video_latent=cached_stage_2_video_latent,
         cached_stage_2_audio_latent=cached_stage_2_audio_latent,
         save_stage_2_input_path=args.save_stage_2_input,
         stage_2_input_metadata=stage_2_cache_metadata,
         # streaming_prefetch_count=args.streaming_prefetch_count,
     )
+    if args.stage_2_noise_bundle_save:
+        assert stage_2_noise_bundle is not None
+        save_stage2_noise_bundle(args.stage_2_noise_bundle_save, stage_2_noise_bundle)
 
     output_path = Path(args.output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1066,7 +1460,7 @@ def main() -> None:
         video_chunks_number=output_chunks,
     )
 
-    if controlled_stage_2:
+    if not args.skip_stage_2:
         if cache_manifest is None and args.save_stage_2_input:
             cache_path = Path(args.save_stage_2_input).expanduser().resolve()
             cache_manifest = json.loads(cache_path.with_suffix(cache_path.suffix + ".json").read_text())
@@ -1078,9 +1472,53 @@ def main() -> None:
             ),
             "stage_2_dress_video_contribution": args.stage_2_dress_video_contribution,
             "stage_2_ic_lora_strength": args.stage_2_ic_lora_strength,
+            "stage_2_lora_execution": args.stage_2_lora_execution,
+            "stage_2_noise_bundle_load": args.stage_2_noise_bundle_load,
+            "stage_2_noise_bundle_save": args.stage_2_noise_bundle_save,
+            "stage_2_noise_bundle_checksums": (
+                stage_2_noise_bundle.checksums() if stage_2_noise_bundle is not None else None
+            ),
             "stage_2_noise_seed": args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed,
+            "stage_2_noise": stage_2_noise_config.manifest_dict(),
+            "stage_2_noise_diagnostics": stage_2_noise_diagnostics,
+            "stage_2_start_sigma": args.stage_2_start_sigma,
+            "stage_2_sigmas": [float(sigma) for sigma in stage_2_sigmas],
             "stage_2_prediction_dir": args.stage_2_prediction_dir,
+            "stage_2_kv_mode": args.stage_2_kv_mode,
+            "stage_2_dual_image_ic_lora": args.stage_2_dual_image_ic_lora,
+            "stage_2_kv_include_inside_mask": args.stage_2_kv_anchor_region == "all",
+            "stage_2_kv_anchor_region": args.stage_2_kv_anchor_region,
+            "stage_2_kv_strength": args.stage_2_kv_strength,
+            "stage_2_kv_layers": args.stage_2_kv_layers,
+            "stage_2_kv_cache_backend": args.stage_2_kv_cache_backend,
+            "stage_2_kv_cache_dir": args.stage_2_kv_cache_dir,
+            "stage_2_appearance_reference": (
+                str(Path(args.stage_2_appearance_reference).expanduser().resolve())
+                if args.stage_2_appearance_reference
+                else None
+            ),
+            "stage_2_appearance_reference_video": (
+                str(Path(args.stage_2_appearance_reference_video).expanduser().resolve())
+                if args.stage_2_appearance_reference_video
+                else None
+            ),
+            "stage_2_appearance_reference_mask": (
+                str(Path(args.stage_2_appearance_reference_mask).expanduser().resolve())
+                if args.stage_2_appearance_reference_mask
+                else None
+            ),
+            "stage_2_reference_attention_mode": args.stage_2_reference_attention_mode,
+            "stage_2_reference_position_mode": args.stage_2_reference_position_mode,
+            "stage_2_reference_kv_strength": args.stage_2_reference_kv_strength,
+            "stage_2_reference_kv_layers": args.stage_2_reference_kv_layers,
+            "stage_2_reference_noise_seed": (
+                args.stage_2_reference_noise_seed
+                if args.stage_2_reference_noise_seed is not None
+                else (args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed) + 3
+            ),
+            "stage_2_reference_edit_conditioning": args.stage_2_reference_edit_conditioning,
             "stage_2_input_cache": args.load_stage_2_input or args.save_stage_2_input,
+            "stage_2_input_cache_metadata_ignored": args.load_stage_2_input_ignore_metadata,
             "stage_2_input_video_checksum": cache_manifest.get("video_checksum") if cache_manifest else None,
             "stage_2_input_audio_checksum": cache_manifest.get("audio_checksum") if cache_manifest else None,
             "stage_1_fingerprint": stage_2_cache_metadata["stage_1_fingerprint"],
@@ -1090,7 +1528,13 @@ def main() -> None:
         }
         run_manifest_path = output_path.with_suffix(output_path.suffix + ".stage2.json")
         run_manifest_path.write_text(json.dumps(run_manifest, indent=2, sort_keys=True) + "\n")
-        print(f"Wrote controlled Stage-2 run manifest to {run_manifest_path}")
+        print(f"Wrote Stage-2 run manifest to {run_manifest_path}")
+
+    if args.stage_2_noise_diagnostics:
+        diagnostics_path = Path(args.stage_2_noise_diagnostics).expanduser().resolve()
+        diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        diagnostics_path.write_text(json.dumps(stage_2_noise_diagnostics, indent=2, sort_keys=True) + "\n")
+        print(f"Wrote Stage-2 noise diagnostics to {diagnostics_path}")
 
     if args.source_strength_log:
         log_path = Path(args.source_strength_log).expanduser().resolve()
@@ -1106,6 +1550,7 @@ def main() -> None:
                 "routing": row.routing.value,
                 "target_token_count": row.target_token_count,
                 "source_token_ranges": row.source_token_ranges,
+                "source_range_strengths": row.source_range_strengths,
                 "composed_existing_mask": row.composed_existing_mask,
                 "num_evaluations": row.num_evaluations,
             }
@@ -1150,7 +1595,7 @@ def main() -> None:
         f"Stage 2 conditioning attention strength={args.stage_2_conditioning_attention_strength}, "
         f"no image conditioning={args.no_image_conditioning}, "
         f"reference image replace="
-        f"{sorted(reference_image_replace) if reference_image_replace is not None else 'default(0)'}"
+        f"{('none' if args.no_image_conditioning else (sorted(reference_image_replace) if reference_image_replace is not None else 'default(0)'))}"
     )
     if args.no_image_conditioning and not args.skip_stage_2:
         print(

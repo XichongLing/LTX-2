@@ -8,6 +8,10 @@ logic via the module-level :func:`_guided_denoise` function, which batches
 all guidance passes into a single transformer call.
 """
 
+from collections.abc import Callable
+import math
+from dataclasses import replace
+
 import torch
 
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderFactory, MultiModalGuiderParams
@@ -19,6 +23,13 @@ from ltx_core.guidance.perturbations import (
 )
 from ltx_core.model.transformer import X0Model
 from ltx_core.types import LatentState
+from ltx_pipelines.utils.conditioning_schedules import (
+    FirstFrameAttentionEvaluation,
+    FirstFrameAttentionSchedule,
+    SourceStrengthEvaluation,
+    SourceStrengthRouting,
+    SourceStrengthSchedule,
+)
 from ltx_pipelines.utils.helpers import modality_from_latent_state
 from ltx_pipelines.utils.types import DenoisedLatentResult
 
@@ -227,6 +238,207 @@ class SimpleDenoiser:
             DenoisedLatentResult.result_or_none(denoised=denoised_video),
             DenoisedLatentResult.result_or_none(denoised=denoised_audio),
         )
+
+
+class SourceStrengthScheduledDenoiser:
+    """Scale scheduled video self-attention blocks immediately before each model call."""
+
+    def __init__(
+        self,
+        inner: object,
+        *,
+        schedule: SourceStrengthSchedule,
+        target_token_count: int,
+        source_token_counts: tuple[int, ...],
+        source_range_strengths: tuple[float, ...] | None = None,
+        routing: SourceStrengthRouting = SourceStrengthRouting.SYMMETRIC,
+        num_evaluations: int | None = None,
+        sink: Callable[[SourceStrengthEvaluation], None] | None = None,
+        first_frame_schedule: FirstFrameAttentionSchedule | None = None,
+        first_frame_token_count: int | None = None,
+        first_frame_sink: Callable[[FirstFrameAttentionEvaluation], None] | None = None,
+    ) -> None:
+        self.inner = inner
+        self.schedule = schedule
+        self.target_token_count = target_token_count
+        self.source_token_counts = source_token_counts
+        self.source_range_strengths = source_range_strengths or tuple(1.0 for _ in source_token_counts)
+        if len(self.source_range_strengths) != len(source_token_counts):
+            raise ValueError("source_range_strengths must match source_token_counts")
+        if any(not math.isfinite(value) or value < 0.0 for value in self.source_range_strengths):
+            raise ValueError("source_range_strengths must be finite and non-negative")
+        self.routing = SourceStrengthRouting(routing)
+        self.num_evaluations = num_evaluations
+        self.sink = sink
+        self.first_frame_schedule = first_frame_schedule
+        self.first_frame_token_count = first_frame_token_count
+        self.first_frame_sink = first_frame_sink
+        self._evaluation_index = 0
+
+    def _source_token_ranges(self, total_tokens: int) -> tuple[tuple[int, int], ...]:
+        source_total = sum(self.source_token_counts)
+        if source_total <= 0:
+            return ()
+        if total_tokens < self.target_token_count + source_total:
+            raise ValueError(
+                f"latent state has {total_tokens} tokens, which cannot contain "
+                f"{self.target_token_count} target tokens and {source_total} source tokens"
+            )
+        start = total_tokens - source_total
+        ranges = []
+        for count in self.source_token_counts:
+            stop = start + count
+            ranges.append((start, stop))
+            start = stop
+        return tuple(ranges)
+
+    def _frame0_ranges(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        if self.first_frame_token_count is None:
+            raise ValueError("first_frame_token_count is required when first_frame_schedule is set")
+        if not 0 < self.first_frame_token_count <= self.target_token_count:
+            raise ValueError(
+                "first_frame_token_count must be positive and no larger than target_token_count: "
+                f"got {self.first_frame_token_count} and {self.target_token_count}"
+            )
+        return (0, self.first_frame_token_count), (self.first_frame_token_count, self.target_token_count)
+
+    def _attention_mask_for_edit(self, video_state: LatentState) -> tuple[torch.Tensor, bool]:
+        total_tokens = video_state.latent.shape[1]
+        if video_state.attention_mask is None:
+            return (
+                torch.ones(
+                    (video_state.latent.shape[0], total_tokens, total_tokens),
+                    device=video_state.latent.device,
+                    dtype=video_state.latent.dtype,
+                ),
+                False,
+            )
+        return video_state.attention_mask.clone(), True
+
+    def _scheduled_video_state(
+        self,
+        video_state: LatentState,
+        *,
+        g_source: float,
+        h_first_frame: float,
+    ) -> tuple[
+        LatentState,
+        bool,
+        tuple[tuple[int, int], ...],
+        tuple[int, int] | None,
+        tuple[int, int] | None,
+    ]:
+        total_tokens = video_state.latent.shape[1]
+        source_ranges = self._source_token_ranges(total_tokens)
+        effective_strengths = tuple(g_source * value for value in self.source_range_strengths)
+        needs_source_edit = bool(source_ranges) and any(value != 1.0 for value in effective_strengths)
+        needs_frame0_edit = self.first_frame_schedule is not None and h_first_frame != 1.0
+        frame0_range = None
+        later_target_range = None
+        if self.first_frame_schedule is not None:
+            frame0_range, later_target_range = self._frame0_ranges()
+
+        if not needs_source_edit and not needs_frame0_edit:
+            return video_state, video_state.attention_mask is not None, source_ranges, frame0_range, later_target_range
+
+        attention_mask, composed_existing_mask = self._attention_mask_for_edit(video_state)
+
+        if needs_source_edit:
+            for (start, stop), effective_strength in zip(source_ranges, effective_strengths, strict=True):
+                attention_mask[:, : self.target_token_count, start:stop] *= effective_strength
+                if self.routing == SourceStrengthRouting.SYMMETRIC:
+                    attention_mask[:, start:stop, : self.target_token_count] *= effective_strength
+
+        if needs_frame0_edit:
+            assert frame0_range is not None
+            assert later_target_range is not None
+            frame0_start, frame0_stop = frame0_range
+            later_start, later_stop = later_target_range
+            attention_mask[:, later_start:later_stop, frame0_start:frame0_stop] *= h_first_frame
+
+        return replace(video_state, attention_mask=attention_mask), composed_existing_mask, source_ranges, frame0_range, later_target_range
+
+    def __call__(
+        self,
+        transformer: X0Model,
+        video_state: LatentState | None,
+        audio_state: LatentState | None,
+        sigmas: torch.Tensor,
+        step_index: int,
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
+        sigma = sigmas[step_index]
+        next_sigma = sigmas[step_index + 1] if step_index + 1 < sigmas.numel() else None
+        if self.num_evaluations is not None and self.num_evaluations > 1:
+            progress = self._evaluation_index / (self.num_evaluations - 1)
+        else:
+            progress = 0.0
+        sigma_float = float(sigma.detach().cpu())
+        next_sigma_float = float(next_sigma.detach().cpu()) if next_sigma is not None else None
+        g_source = self.schedule.strength(
+            sigma=sigma_float,
+            progress=progress,
+            evaluation_index=self._evaluation_index,
+            num_evaluations=self.num_evaluations,
+        )
+        h_first_frame = (
+            self.first_frame_schedule.multiplier(
+                sigma=sigma_float,
+                progress=progress,
+                evaluation_index=self._evaluation_index,
+                num_evaluations=self.num_evaluations,
+            )
+            if self.first_frame_schedule is not None
+            else 1.0
+        )
+
+        composed_existing_mask = False
+        source_ranges: tuple[tuple[int, int], ...] = ()
+        frame0_range: tuple[int, int] | None = None
+        later_target_range: tuple[int, int] | None = None
+        if video_state is not None:
+            video_state, composed_existing_mask, source_ranges, frame0_range, later_target_range = (
+                self._scheduled_video_state(video_state, g_source=g_source, h_first_frame=h_first_frame)
+            )
+
+        if self.sink is not None:
+            self.sink(
+                SourceStrengthEvaluation(
+                    evaluation_index=self._evaluation_index,
+                    nominal_step_index=step_index,
+                    sigma=sigma_float,
+                    next_sigma=next_sigma_float,
+                    progress=progress,
+                    g_source=g_source,
+                    routing=self.routing,
+                    target_token_count=self.target_token_count,
+                    source_token_ranges=source_ranges,
+                    composed_existing_mask=composed_existing_mask,
+                    num_evaluations=self.num_evaluations,
+                    source_range_strengths=tuple(
+                        g_source * value for value in self.source_range_strengths
+                    ),
+                )
+            )
+        if self.first_frame_sink is not None and self.first_frame_schedule is not None:
+            if frame0_range is None or later_target_range is None:
+                frame0_range, later_target_range = self._frame0_ranges()
+            self.first_frame_sink(
+                FirstFrameAttentionEvaluation(
+                    evaluation_index=self._evaluation_index,
+                    nominal_step_index=step_index,
+                    sigma=sigma_float,
+                    next_sigma=next_sigma_float,
+                    progress=progress,
+                    h_first_frame=h_first_frame,
+                    target_token_count=self.target_token_count,
+                    frame0_token_range=frame0_range,
+                    later_target_token_range=later_target_range,
+                    composed_existing_mask=composed_existing_mask,
+                    num_evaluations=self.num_evaluations,
+                )
+            )
+        self._evaluation_index += 1
+        return self.inner(transformer, video_state, audio_state, sigmas, step_index)
 
 
 class GuidedDenoiser:

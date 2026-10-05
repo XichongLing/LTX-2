@@ -22,7 +22,7 @@ from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.components.protocols import DiffusionStepProtocol
-from ltx_core.loader import SDOps
+from ltx_core.loader import LoraStateDictWithStrength, SDOps, attach_runtime_loras
 from ltx_core.loader.attention_ops import set_attention_module_op
 from ltx_core.loader.fuse_loras import bf16_fuse_rule
 from ltx_core.loader.module_ops import ModuleOps
@@ -207,6 +207,7 @@ class DiffusionStage:
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         transformer_builder: ModelBuilderProtocol[LTXModel] | None = None,
+        runtime_loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -214,6 +215,18 @@ class DiffusionStage:
         self._quantization = quantization
         self._compilation_config = compilation_config
         self._offload_mode = offload_mode
+        self._runtime_loras = tuple(runtime_loras)
+        if self._runtime_loras:
+            if loras:
+                raise ValueError("fused and runtime LoRAs cannot be configured on the same diffusion stage")
+            if compilation_config is not None:
+                raise ValueError("runtime LoRA is not supported with torch.compile")
+            if offload_mode != OffloadMode.NONE:
+                raise ValueError("runtime LoRA is not supported with layer streaming")
+            if quantization is not None and quantization.fuse_rule is not fp8_cast_fuse_rule:
+                raise ValueError("runtime LoRA initially supports only BF16 and fp8-cast transformers")
+            if transformer_builder is not None and not isinstance(transformer_builder, Builder):
+                raise TypeError("runtime LoRA requires SingleGPUModelBuilder")
         configurator = (
             quantization.model_configurator
             if quantization is not None and quantization.model_configurator is not None
@@ -296,7 +309,20 @@ class DiffusionStage:
         builder = self._transformer_builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
         if self._quantization is not None:
             builder = builder.with_fuse_rule(self._quantization.fuse_rule)
-        return X0Model(builder.build(device=target, **kwargs)).to(target).eval()
+        velocity_model = builder.build(device=target, **kwargs)
+        if self._runtime_loras:
+            if not isinstance(builder, Builder):
+                raise TypeError("runtime LoRA requires SingleGPUModelBuilder")
+            adapters = [
+                LoraStateDictWithStrength(
+                    builder.load_sd([lora.path], builder.registry, target, lora.sd_ops),
+                    lora.strength,
+                )
+                for lora in self._runtime_loras
+            ]
+            count = attach_runtime_loras(velocity_model, adapters)
+            logger.info("Attached runtime LoRA residuals to %d linear layers", count)
+        return X0Model(velocity_model).to(target).eval()
 
     @contextmanager
     def _streaming_transformer_ctx(self) -> Iterator[X0Model]:

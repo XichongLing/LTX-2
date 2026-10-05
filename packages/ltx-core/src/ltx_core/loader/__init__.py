@@ -16,6 +16,12 @@ from ltx_core.loader.primitives import (
     StateDictLoader,
 )
 from ltx_core.loader.registry import DummyRegistry, Registry, StateDictRegistry
+from ltx_core.loader.runtime_lora import (
+    RuntimeLoraLinear,
+    attach_runtime_loras,
+    runtime_lora_scale,
+    set_runtime_lora_scale,
+)
 from ltx_core.loader.sd_ops import (
     LTXV_LORA_COMFY_RENAMING_MAP,
     ContentMatching,
@@ -41,6 +47,7 @@ __all__ = [
     "ModelBuilderProtocol",
     "ModuleOps",
     "Registry",
+    "RuntimeLoraLinear",
     "SDKeyValueOperation",
     "SDOps",
     "SafetensorsModelStateDictLoader",
@@ -50,7 +57,10 @@ __all__ = [
     "StateDictLoader",
     "StateDictRegistry",
     "apply_loras",
+    "attach_runtime_loras",
     "create_meta_model",
     "load_state_dict",
     "read_model_config",
+    "runtime_lora_scale",
+    "set_runtime_lora_scale",
 ]
