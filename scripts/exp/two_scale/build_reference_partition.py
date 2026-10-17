@@ -62,8 +62,6 @@ def main() -> None:
         raise ValueError("inside/outside scales must be positive")
     if args.inside_scale <= args.outside_scale:
         raise ValueError("inside-scale must be coarser/larger than outside-scale for complement tiling")
-    if args.inside_scale % args.outside_scale:
-        raise ValueError("inside-scale must be an integer multiple of outside-scale")
     if not 0.0 <= args.threshold <= 1.0:
         raise ValueError("threshold must be in [0,1]")
     if args.inside_strength < 0 or args.outside_strength < 0:
@@ -85,14 +83,30 @@ def main() -> None:
     outside_h, outside_w = _grid_size(args.stage1_height, args.stage1_width, args.outside_scale)
 
     inside = _hard_tokens(binary.float(), frames=latent_frames, grid_h=inside_h, grid_w=inside_w, fps=args.fps)
-    ratio = args.inside_scale // args.outside_scale
-    inside_on_outside_grid = inside.repeat_interleave(ratio, dim=1).repeat_interleave(ratio, dim=2)
-    if inside_on_outside_grid.shape != (latent_frames, outside_h, outside_w):
-        raise AssertionError(
-            "inside mask does not tile the outside grid: "
-            f"inside_up={tuple(inside_on_outside_grid.shape)} outside={(latent_frames, outside_h, outside_w)}"
-        )
-    outside = ~inside_on_outside_grid
+    nested = args.inside_scale % args.outside_scale == 0
+    if nested:
+        ratio = args.inside_scale // args.outside_scale
+        inside_on_outside_grid = inside.repeat_interleave(ratio, dim=1).repeat_interleave(ratio, dim=2)
+        if inside_on_outside_grid.shape != (latent_frames, outside_h, outside_w):
+            raise AssertionError(
+                "inside mask does not tile the outside grid: "
+                f"inside_up={tuple(inside_on_outside_grid.shape)} outside={(latent_frames, outside_h, outside_w)}"
+            )
+        outside = ~inside_on_outside_grid
+        overlap_cells = torch.zeros(latent_frames, dtype=torch.int64)
+    else:
+        # Non-nested grids (e.g. inside 3 / outside 2): compare footprints on the Stage-1 latent grid
+        # (one cell per VAE token). Drop an outside token only where kept inside tokens fully cover it,
+        # so boundary cells may be seen by both scales but no cell is left without source tokens.
+        inside_base = inside.repeat_interleave(args.inside_scale, dim=1).repeat_interleave(args.inside_scale, dim=2)
+        coverage = torch.nn.functional.avg_pool2d(
+            inside_base.float().unsqueeze(1), kernel_size=args.outside_scale
+        ).squeeze(1)
+        outside = coverage < 1.0
+        outside_base = outside.repeat_interleave(args.outside_scale, dim=1).repeat_interleave(args.outside_scale, dim=2)
+        if not torch.all(inside_base | outside_base):
+            raise AssertionError("non-nested partition leaves Stage-1 cells without any reference token")
+        overlap_cells = (inside_base & outside_base).sum(dim=(1, 2)).to(torch.int64)
 
     outside_path = output_dir / "K_outside.pt"
     inside_path = output_dir / "K_inside.pt"
@@ -123,7 +137,7 @@ def main() -> None:
 
     n_inside = inside.sum(dim=(1, 2)).to(torch.int64)
     n_outside = outside.sum(dim=(1, 2)).to(torch.int64)
-    expected_outside = outside_h * outside_w - (ratio * ratio) * n_inside
+    expected_outside = outside_h * outside_w - (ratio * ratio) * n_inside if nested else n_outside
     if not torch.equal(n_outside, expected_outside):
         raise AssertionError(
             f"partition does not tile the outside grid: outside={n_outside.tolist()} "
@@ -143,6 +157,8 @@ def main() -> None:
         "outside_shape": list(outside.shape),
         "inside_kept_per_frame": n_inside.tolist(),
         "outside_kept_per_frame": n_outside.tolist(),
+        "nested_tiling": nested,
+        "overlap_stage1_cells_per_frame": overlap_cells.tolist(),
         "total_reference_tokens": int(n_inside.sum() + n_outside.sum()),
         "inside_frame0": inside[0].to(torch.int64).tolist(),
         "outside_frame0": outside[0].to(torch.int64).tolist(),

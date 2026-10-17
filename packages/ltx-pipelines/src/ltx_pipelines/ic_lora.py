@@ -39,8 +39,14 @@ from ltx_pipelines.iclora_utils import (
     downsample_mask_video_to_latent,
     read_lora_reference_downscale_factor,
 )
+from ltx_pipelines.stage1_phi_noise import (
+    Stage1PhiNoiseConfig,
+    Stage1PhiNoisePhaseSource,
+    load_stage1_phi_source_latent,
+    make_stage1_noiser,
+)
 from ltx_pipelines.stage2_kv import Stage2KVAttentionController, Stage2KVCache, Stage2KVMode
-from ltx_pipelines.stage2_noise import Stage2NoiseConfig, make_stage2_noiser
+from ltx_pipelines.stage2_noise import Stage2NoiseConfig, Stage2NoisePhaseSource, make_stage2_noiser
 from ltx_pipelines.stage2_reference import (
     Stage2ReferenceAttentionController,
     Stage2ReferenceAttentionMode,
@@ -86,7 +92,7 @@ from ltx_pipelines.utils.constants import (
     detect_params,
 )
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser, SourceStrengthScheduledDenoiser
-from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
+from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device, video_latent_from_file
 from ltx_pipelines.utils.media_io import (
     decode_video_by_frame,
     encode_video,
@@ -275,9 +281,13 @@ class ICLoraPipeline:
         stage_2_branch_mode: Stage2BranchMode | str = Stage2BranchMode.LEGACY,
         stage_2_video_mix: float = 0.5,
         stage_2_routing_mask: torch.Tensor | None = None,
+        stage_2_routing_mask_mode: str = "soft",
         stage_2_dress_video_contribution: float | None = None,
         stage_2_noise_seed: int | None = None,
         stage_2_noise_config: Stage2NoiseConfig | None = None,
+        stage_2_noise_source_video: str | None = None,
+        stage_1_phi_noise_config: Stage1PhiNoiseConfig | None = None,
+        stage_1_phi_noise_source_video: str | None = None,
         stage_2_prediction_dir: str | None = None,
         stage_2_kv_mode: Stage2KVMode | str = Stage2KVMode.NONE,
         stage_2_kv_strength: float = 1.0,
@@ -285,6 +295,7 @@ class ICLoraPipeline:
         stage_2_kv_cache_backend: str = "cpu",
         stage_2_kv_cache_dir: str | None = None,
         stage_2_dual_image_ic_lora: bool = True,
+        stage_2_image_ic_lora: bool = False,
         stage_2_kv_include_inside_mask: bool = False,
         stage_2_kv_anchor_region: str = "outside",
         stage_2_appearance_reference: str | None = None,
@@ -433,6 +444,14 @@ class ICLoraPipeline:
             and stage_2_branch_mode is not Stage2BranchMode.VIDEO
         ):
             raise ValueError("fused Stage-2 IC-LoRA is only valid for the single routed video branch")
+        if stage_2_image_ic_lora and (
+            stage_2_branch_mode
+            not in (Stage2BranchMode.IMAGE, Stage2BranchMode.GLOBAL, Stage2BranchMode.SPATIAL)
+            or not self.stage_2_runtime_lora_enabled
+        ):
+            raise ValueError("stage_2_image_ic_lora requires runtime Stage-2 LoRA and an image/global/spatial branch mode")
+        if stage_2_routing_mask_mode not in {"soft", "hard"}:
+            raise ValueError(f"stage_2_routing_mask_mode must be 'soft' or 'hard', got {stage_2_routing_mask_mode!r}")
         if stage_2_branch_mode is Stage2BranchMode.DUAL:
             if stage_2_routing_mask is None:
                 raise ValueError("dual Stage-2 routing requires a routing mask")
@@ -496,6 +515,7 @@ class ICLoraPipeline:
             raise ValueError("attention probing is not yet supported by routed Stage 2")
         stage_2_noise_seed = seed if stage_2_noise_seed is None else stage_2_noise_seed
         stage_2_noise_config = stage_2_noise_config or Stage2NoiseConfig()
+        stage_1_phi_noise_config = stage_1_phi_noise_config or Stage1PhiNoiseConfig()
         stage_2_reference_noise_seed = (
             stage_2_noise_seed + 3 if stage_2_reference_noise_seed is None else stage_2_reference_noise_seed
         )
@@ -540,6 +560,58 @@ class ICLoraPipeline:
 
             stage_1_target_shape = VideoLatentShape.from_pixel_shape(stage_1_output_shape)
             stage_1_frame0_token_count = stage_1_target_shape.height * stage_1_target_shape.width
+            stage_1_video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), stage_1_target_shape, frame_rate)
+
+            stage_1_phi_source_latent = None
+            if stage_1_phi_noise_config.enabled:
+                if stage_1_phi_noise_config.phase_source is Stage1PhiNoisePhaseSource.OWN:
+                    stage_1_phi_source_latent = torch.zeros(
+                        *stage_1_target_shape.to_torch_shape(),
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                elif stage_1_phi_noise_config.source_latent_path:
+                    stage_1_phi_source_latent = load_stage1_phi_source_latent(
+                        stage_1_phi_noise_config.source_latent_path
+                    ).to(device=self.device, dtype=self.dtype)
+                else:
+                    source_video_path = stage_1_phi_noise_source_video or (
+                        video_conditioning[0][0] if video_conditioning else None
+                    )
+                    if source_video_path is None:
+                        raise ValueError(
+                            "Stage-1 Phi-noise phase_source=source requires a source video conditioning asset "
+                            "or --phi-source-latent"
+                        )
+
+                    def _encode_stage1_phi_source(enc: VideoEncoder) -> torch.Tensor:
+                        return video_latent_from_file(
+                            video_encoder=enc,
+                            file_path=source_video_path,
+                            output_shape=stage_1_output_shape,
+                            device=self.device,
+                            dtype=self.dtype,
+                            tiling_config=self.CONDITIONING_VIDEO_TILING,
+                        )
+
+                    stage_1_phi_source_latent = self.image_conditioner(_encode_stage1_phi_source)
+                if tuple(stage_1_phi_source_latent.shape) != tuple(stage_1_target_shape.to_torch_shape()):
+                    raise ValueError(
+                        "Stage-1 Phi-noise source latent shape must match Stage-1 target: "
+                        f"source={tuple(stage_1_phi_source_latent.shape)}, "
+                        f"target={tuple(stage_1_target_shape.to_torch_shape())}"
+                    )
+                logging.info(
+                    "[IC-LoRA] Stage 1 Phi-noise source latent shape: %s",
+                    tuple(stage_1_phi_source_latent.shape),
+                )
+
+            stage_1_noiser = make_stage1_noiser(
+                generator=generator,
+                video_tools=stage_1_video_tools,
+                source_latent=stage_1_phi_source_latent,
+                config=stage_1_phi_noise_config,
+            )
 
             # Encode conditionings using the video encoder block
             stage_1_conditionings, stage_1_source_token_counts = self.image_conditioner(
@@ -615,7 +687,7 @@ class ICLoraPipeline:
             video_state, audio_state = self.stage_1(
                 denoiser=stage_1_denoiser,
                 sigmas=stage_1_sigmas,
-                noiser=noiser,
+                noiser=stage_1_noiser,
                 width=stage_1_output_shape.width,
                 height=stage_1_output_shape.height,
                 frames=num_frames,
@@ -698,6 +770,51 @@ class ICLoraPipeline:
             f"(B={stage_2_output_shape.batch}, C=3, F={stage_2_output_shape.frames}, "
             f"H={stage_2_output_shape.height}, W={stage_2_output_shape.width})"
         )
+        stage_2_noise_reference_latent = upscaled_video_latent
+        if stage_2_noise_config.phase_source is Stage2NoisePhaseSource.SOURCE_VIDEO:
+            if stage_2_noise_source_video is not None:
+                source_phase_path = stage_2_noise_source_video
+            elif video_conditioning:
+                source_phase_path = video_conditioning[0][0]
+            else:
+                raise ValueError(
+                    "source_video Stage-2 noise phase requires a stage_2_noise_source_video path "
+                    "or at least one video conditioning asset"
+                )
+
+            def _encode_source_video_phase(enc: VideoEncoder) -> torch.Tensor:
+                source_phase_pixels = video_preprocess(
+                    decode_video_by_frame(
+                        path=source_phase_path,
+                        frame_cap=num_frames,
+                        device=self.device,
+                    ),
+                    stage_2_output_shape.height,
+                    stage_2_output_shape.width,
+                    self.dtype,
+                    self.device,
+                )
+                if source_phase_pixels.shape[2] != num_frames:
+                    raise ValueError(
+                        "source_video Stage-2 noise phase requires the source video to contain at least "
+                        f"{num_frames} frames, decoded {source_phase_pixels.shape[2]}"
+                    )
+                return enc.tiled_encode(
+                    source_phase_pixels,
+                    tiling_config=self.CONDITIONING_VIDEO_TILING,
+                )
+
+            stage_2_noise_reference_latent = self.image_conditioner(_encode_source_video_phase)
+            if stage_2_noise_reference_latent.shape != upscaled_video_latent.shape:
+                raise ValueError(
+                    "source_video Stage-2 noise phase latent shape must match Stage-2 target latent: "
+                    f"source={tuple(stage_2_noise_reference_latent.shape)}, "
+                    f"target={tuple(upscaled_video_latent.shape)}"
+                )
+            logging.info(
+                "[IC-LoRA] Stage 2 Phi-noise phase source video latent shape: %s",
+                tuple(stage_2_noise_reference_latent.shape),
+            )
         if stage_2_branch_mode.is_routed:
             def _routed_conditionings(
                 enc: VideoEncoder,
@@ -834,8 +951,14 @@ class ICLoraPipeline:
                     stage_2_routing_mask.to(device=self.device), video_tools
                 )
                 if stage_2_branch_mode is Stage2BranchMode.DUAL
+                or (stage_2_routing_mask_mode == "hard" and stage_2_routing_mask is not None)
                 else None
             )
+            if stage_2_routing_mask_mode == "hard" and hard_routing_tokens is not None:
+                # Blend latents with the same binary token set the KV partition uses, so a moving
+                # subject's whole per-latent-frame footprint comes from one branch instead of a
+                # temporally averaged mix of two trajectories.
+                routing_tokens = hard_routing_tokens.to(dtype=torch.float32)
             recorder = (
                 Stage2PredictionRecorder(
                     stage_2_prediction_dir,
@@ -843,6 +966,7 @@ class ICLoraPipeline:
                         "mode": stage_2_branch_mode.value,
                         "video_mix": stage_2_video_mix,
                         "dress_video_contribution": stage_2_dress_video_contribution,
+                        "routing_mask_mode": stage_2_routing_mask_mode,
                         "noise_seed": stage_2_noise_seed,
                         "target_shape": list(upscaled_video_latent.shape),
                         "stage_2_input_checksum": tensor_checksum(upscaled_video_latent),
@@ -956,6 +1080,7 @@ class ICLoraPipeline:
                         recorder=recorder,
                         video_denoise_mask=stage_2_denoise_mask,
                         stage_2_noise_config=stage_2_noise_config,
+                        stage_2_noise_reference_latent=stage_2_noise_reference_latent,
                         video_branch_runtime_lora=self.stage_2_runtime_lora_enabled,
                     )
                 else:
@@ -978,6 +1103,8 @@ class ICLoraPipeline:
                         recorder=recorder,
                         video_denoise_mask=stage_2_denoise_mask,
                         stage_2_noise_config=stage_2_noise_config,
+                        stage_2_noise_reference_latent=stage_2_noise_reference_latent,
+                        image_branch_ic_lora=stage_2_image_ic_lora,
                     )
             decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
             decoded_audio = self.audio_decoder(audio_state.latent)
@@ -1069,7 +1196,7 @@ class ICLoraPipeline:
         stage_2_noiser = make_stage2_noiser(
             generator=generator,
             video_tools=stage_2_video_tools,
-            reference_latent=upscaled_video_latent,
+            reference_latent=stage_2_noise_reference_latent,
             config=stage_2_noise_config,
         )
         video_state, audio_state = self.stage_2(

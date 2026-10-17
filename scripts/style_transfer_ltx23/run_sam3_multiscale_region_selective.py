@@ -39,7 +39,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-image", required=True)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--negative-prompt", default=DEFAULT_NEGATIVE_PROMPT)
-    parser.add_argument("--stage1-mask-concept", required=True)
+    parser.add_argument(
+        "--stage1-conditioning",
+        choices=("multiscale", "single-scale"),
+        default="multiscale",
+        help="Stage-1 source-token policy. single-scale skips Stage-1 SAM3 and reference partitioning.",
+    )
+    parser.add_argument(
+        "--stage1-mask-concept",
+        default=None,
+        help="SAM3 concept for multiscale Stage 1; required only with --stage1-conditioning multiscale.",
+    )
     parser.add_argument("--stage2-mask-concept", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--seed", type=int, default=42)
@@ -68,6 +78,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--partition-threshold", type=float, default=0.5)
     parser.add_argument("--inside-strength", type=float, default=1.0)
     parser.add_argument("--outside-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--stage1-reference-downscale-factor",
+        type=int,
+        default=None,
+        help=(
+            "Optional reference-token downscale override. When omitted, single-scale uses the "
+            "IC-LoRA metadata (currently 2); multiscale retains its existing explicit factor 2."
+        ),
+    )
     parser.add_argument("--stage-1-ic-lora-strength", type=float, default=1.0)
     parser.add_argument("--stage-2-ic-lora-strength", type=float, default=1.0)
     parser.add_argument("--stage-2-noise-seed", type=int, default=None)
@@ -206,8 +225,8 @@ def ensure_sam3_masks(
     return mask_dir
 
 
-def ltx_common_args(args: argparse.Namespace, repo: Path) -> list[str]:
-    return [
+def ltx_common_args(args: argparse.Namespace, repo: Path, *, reference_downscale_factor: int | None) -> list[str]:
+    command = [
         str(Path(args.ltx_python).expanduser().resolve() if args.ltx_python else repo / ".venv/bin/python3"),
         str(repo / "scripts/style_transfer_ltx23/run_ic_lora_style_transfer.py"),
         "--distilled-checkpoint-path",
@@ -266,17 +285,22 @@ def ltx_common_args(args: argparse.Namespace, repo: Path) -> list[str]:
         "1.0",
         "--source-strength-routing",
         "target-queries-only",
-        "--reference-downscale-factor-override",
-        "2",
         "--quantization",
         args.quantization,
     ]
+    if reference_downscale_factor is not None:
+        command += ["--reference-downscale-factor-override", str(reference_downscale_factor)]
+    return command
 
 
 def main() -> None:
     args = parse_args()
     if args.num_frames < 1 or (args.num_frames - 1) % 8:
         raise ValueError("num_frames must follow 8k+1 for the current LTX causal layout")
+    if args.stage1_conditioning == "multiscale" and not args.stage1_mask_concept:
+        raise ValueError("--stage1-mask-concept is required with --stage1-conditioning multiscale")
+    if args.stage1_reference_downscale_factor is not None and args.stage1_reference_downscale_factor < 1:
+        raise ValueError("--stage1-reference-downscale-factor must be positive")
     if args.stage2_mode in {"dual", "spatial"} and not 0.0 <= args.stage2_g <= 1.0:
         raise ValueError("--stage2-g must be in [0,1]")
     if args.stage2_mode != "dual" and args.stage2_kv_mode != "none":
@@ -288,6 +312,11 @@ def main() -> None:
     reference_image = Path(args.reference_image).expanduser().resolve()
     sam3_root = Path(args.sam3_output_root).expanduser().resolve() if args.sam3_output_root else output_root / "sam3"
     stage2_noise_seed = args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed
+    # Single-scale means no spatially varying partition, not a new IC-LoRA scale.
+    # Leave the flag absent there so the adapter metadata remains authoritative.
+    reference_downscale_factor = args.stage1_reference_downscale_factor
+    if reference_downscale_factor is None and args.stage1_conditioning == "multiscale":
+        reference_downscale_factor = 2
 
     source_meta = ffprobe_video(source_video)
     if source_meta["frame_count"] < args.num_frames:
@@ -298,58 +327,62 @@ def main() -> None:
     ensure_link_or_copy(reference_image, output_root / "inputs" / reference_image.name)
 
     commands: dict[str, str] = {}
-    stage1_mask_dir = ensure_sam3_masks(
-        video=source_video,
-        concept=args.stage1_mask_concept,
-        output_dir=sam3_root / f"stage1_{slugify(args.stage1_mask_concept)}",
-        args=args,
-        expected_frames=args.num_frames,
-        commands=commands,
-        key="sam3_stage1",
-    )
+    stage1_mask_dir: Path | None = None
+    partition_config: Path | None = None
+    if args.stage1_conditioning == "multiscale":
+        assert args.stage1_mask_concept is not None
+        stage1_mask_dir = ensure_sam3_masks(
+            video=source_video,
+            concept=args.stage1_mask_concept,
+            output_dir=sam3_root / f"stage1_{slugify(args.stage1_mask_concept)}",
+            args=args,
+            expected_frames=args.num_frames,
+            commands=commands,
+            key="sam3_stage1",
+        )
+        # Validate Stage-1 SAM3 masks under the exact inference resize/crop convention.
+        if not args.dry_run:
+            _ = load_file_mask(
+                path=stage1_mask_dir,
+                num_frames=args.num_frames,
+                height=args.height // 2,
+                width=args.width // 2,
+            )
 
-    # Validate that the mask loader accepts the SAM3 folder under the exact inference resize/crop convention.
-    if not args.dry_run:
-        _ = load_file_mask(path=stage1_mask_dir, num_frames=args.num_frames, height=args.height // 2, width=args.width // 2)
+        partition_dir = output_root / "partition"
+        partition_cmd = [
+            str(Path(args.ltx_python).expanduser().resolve() if args.ltx_python else repo / ".venv/bin/python3"),
+            str(repo / "scripts/exp/two_scale/build_reference_partition.py"),
+            "--mask", str(stage1_mask_dir),
+            "--output-dir", str(partition_dir),
+            "--num-frames", str(args.num_frames),
+            "--stage1-width", str(args.width // 2),
+            "--stage1-height", str(args.height // 2),
+            "--fps", str(args.frame_rate),
+            "--inside-scale", str(args.inside_scale),
+            "--outside-scale", str(args.outside_scale),
+            "--threshold", str(args.partition_threshold),
+            "--inside-strength", str(args.inside_strength),
+            "--outside-strength", str(args.outside_strength),
+        ]
+        commands["build_partition"] = command_to_string(partition_cmd)
+        rc = run_command(
+            partition_cmd,
+            log_path=partition_dir / "build_partition.log",
+            dry_run=args.dry_run,
+            cwd=repo,
+        )
+        if rc != 0:
+            raise RuntimeError(f"partition builder failed with exit code {rc}")
+        partition_config = partition_dir / "ref_partition_config.json"
+    else:
+        commands["sam3_stage1"] = "skipped (--stage1-conditioning single-scale)"
+        commands["build_partition"] = "skipped (--stage1-conditioning single-scale)"
 
-    partition_dir = output_root / "partition"
-    partition_cmd = [
-        str(Path(args.ltx_python).expanduser().resolve() if args.ltx_python else repo / ".venv/bin/python3"),
-        str(repo / "scripts/exp/two_scale/build_reference_partition.py"),
-        "--mask",
-        str(stage1_mask_dir),
-        "--output-dir",
-        str(partition_dir),
-        "--num-frames",
-        str(args.num_frames),
-        "--stage1-width",
-        str(args.width // 2),
-        "--stage1-height",
-        str(args.height // 2),
-        "--fps",
-        str(args.frame_rate),
-        "--inside-scale",
-        str(args.inside_scale),
-        "--outside-scale",
-        str(args.outside_scale),
-        "--threshold",
-        str(args.partition_threshold),
-        "--inside-strength",
-        str(args.inside_strength),
-        "--outside-strength",
-        str(args.outside_strength),
-    ]
-    commands["build_partition"] = command_to_string(partition_cmd)
-    rc = run_command(partition_cmd, log_path=partition_dir / "build_partition.log", dry_run=args.dry_run, cwd=repo)
-    if rc != 0:
-        raise RuntimeError(f"partition builder failed with exit code {rc}")
-    partition_config = partition_dir / "ref_partition_config.json"
-
-    common = ltx_common_args(args, repo)
+    common = ltx_common_args(args, repo, reference_downscale_factor=reference_downscale_factor)
+    partition_args = [] if partition_config is None else ["--ref-partition-config", str(partition_config)]
     stage1_snapshot = output_root / "stage1_snapshot" / "output.mp4"
-    stage1_cmd = common + [
-        "--ref-partition-config",
-        str(partition_config),
+    stage1_cmd = common + partition_args + [
         "--stage-2-ic-lora-strength",
         "0.0",
         "--skip-stage-2",
@@ -378,8 +411,7 @@ def main() -> None:
     baseline_cmd = common + [
         "--source-strength-log",
         str(baseline_dir / "source_strength_log.json"),
-        "--ref-partition-config",
-        str(partition_config),
+        *partition_args,
         "--save-stage-2-input",
         str(cache),
         "--stage-2-branch-mode",
@@ -398,8 +430,7 @@ def main() -> None:
     selective_cmd = common + [
         "--source-strength-log",
         str(selective_dir / "source_strength_log.json"),
-        "--ref-partition-config",
-        str(partition_config),
+        *partition_args,
         "--load-stage-2-input",
         str(cache),
         "--load-stage-2-input-ignore-metadata",
@@ -480,11 +511,16 @@ def main() -> None:
         "height": args.height,
         "num_frames": args.num_frames,
         "frame_rate": args.frame_rate,
+        "stage1_conditioning": args.stage1_conditioning,
+        "stage1_reference_downscale_factor_override": reference_downscale_factor,
+        "stage1_reference_downscale_source": (
+            "explicit_override" if reference_downscale_factor is not None else "ic_lora_metadata"
+        ),
         "stage1_mask_concept": args.stage1_mask_concept,
         "stage2_mask_concept": args.stage2_mask_concept,
-        "stage1_mask_dir": str(stage1_mask_dir),
+        "stage1_mask_dir": str(stage1_mask_dir) if stage1_mask_dir is not None else None,
         "stage2_mask_dir": str(stage2_mask_dir),
-        "partition_config": str(partition_config),
+        "partition_config": str(partition_config) if partition_config is not None else None,
         "stage2_mode": args.stage2_mode,
         "stage2_kv_mode": args.stage2_kv_mode,
         "stage2_g": args.stage2_g,

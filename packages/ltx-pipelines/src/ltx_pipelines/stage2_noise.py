@@ -35,6 +35,7 @@ class Stage2NoiseMaskMode(str, Enum):
 
 class Stage2NoisePhaseSource(str, Enum):
     STAGE1 = "stage1"
+    SOURCE_VIDEO = "source_video"
 
 
 @dataclass

@@ -1,0 +1,501 @@
+TASK BRIEF FOR LOCAL CODEX
+LTX-2.3 IC-LoRA: timestep-dependent source-video conditioning strength
+
+Goal
+====
+
+Implement, document, test, and experimentally evaluate timestep-dependent strength for the appended IC-LoRA source-video condition. The intended behavior is:
+
+    strong source-video access early in rectified-flow denoising
+        -> source establishes motion, camera trajectory, pose, and coarse geometry
+
+    weaker source-video access late in denoising
+        -> reduce copying of source color, texture, materials, lighting, and primitive previz appearance
+
+The clean in-place first-frame/image condition must remain active and unchanged unless an experiment explicitly says otherwise.
+
+This is a conditioning-strength schedule g_source(s), not a replacement diffusion/noise scheduler. Preserve the model's existing sigma/timestep sequence and numerical solver unless repository-specific evidence makes a change necessary. Conceptually:
+
+    sigma_i = existing RF scheduler output
+    g_i     = source_strength_schedule(sigma_i, progress_i, evaluation_index)
+
+    x0_hat_i = model(x_i, sigma_i; first_frame, source_video, g_i)
+    x_{i+1}  = existing_solver_step(x_i, x0_hat_i, sigma_i, sigma_{i+1})
+
+The preferred one-pass implementation changes only attention between generated/target tokens and the appended source-video tokens at each transformer evaluation:
+
+    logits[target_query, source_key] += log(g_i)
+
+If the existing implementation uses a multiplicative [0, 1] attention-strength mask that is later converted to additive log-space, update the relevant target/source mask block per evaluation instead of editing the attention kernel. Preserve and multiply any existing spatial or temporal conditioning mask; do not overwrite it.
+
+Important distinction between two existing strengths
+====================================================
+
+Inspect the local implementation and verify this distinction rather than assuming names:
+
+1. Reference/source latent cleanliness or denoise strength
+   This controls whether appended source tokens remain clean, often through a denoise mask such as 1 - reference_strength. Keep this at its normal fully conditioned value, ordinarily 1.0.
+
+2. Attention/influence strength
+   This controls how strongly target tokens use source tokens. This is the quantity g_source(s) that must vary at inference time.
+
+Do not implement g_source(s) by scaling source latent values unless the local architecture leaves no cleaner hook and experiments justify it. Normalization can cancel latent scaling, and scaling latents confounds content magnitude with routing.
+
+Mandatory local-codebase discovery
+==================================
+
+The local repository may differ substantially from the public Lightricks/LTX-2 repository. Treat upstream filenames and APIs only as orientation. Before editing:
+
+1. Read all applicable AGENTS.md, CLAUDE.md, CONTRIBUTING.md, project instructions, and test instructions.
+2. Record the current git commit, branch, worktree status, installed package versions, checkpoint/model version, LoRA(s), runtime, GPU model/count, and relevant launch environment.
+3. Locate the actual, currently used LTX-2.3 IC-LoRA entry point(s). Determine whether inference runs through:
+   - a local Python pipeline;
+   - Diffusers;
+   - ComfyUI/custom nodes;
+   - a forked LTX pipeline;
+   - another wrapper.
+4. Trace one generation end-to-end:
+   - CLI/API entry point;
+   - construction of image/first-frame conditioning;
+   - source-video VAE encoding and token append;
+   - exact token ordering and token-range boundaries;
+   - attention-mask construction and mask semantics;
+   - denoising loop;
+   - every transformer/denoiser evaluation per inference step;
+   - solver update;
+   - Stage 1 and Stage 2 behavior.
+5. Verify whether the IC-LoRA and source-video tokens are present only in Stage 1 or in multiple stages. Apply the schedule only where source tokens actually exist and the IC-LoRA pathway is active.
+6. Verify whether the model predicts velocity, flow, noise, x0, or another parameterization. Do not change its established conversion or solver logic.
+7. Verify the exact attention mask convention. Determine whether values are Boolean, multiplicative weights, additive biases, or converted via log(weight). Add tests for the observed convention.
+8. Verify the actual target/source token ranges. Do not assume that all tokens after N_target are one source group if the local pipeline can append keyframes, generated keyframe slots, audio, padding, multiple references, or other conditions.
+9. Identify behavior under torch.compile, CUDA graphs, block streaming/offload, quantization, batch splitting, sequence parallelism, and multi-GPU modes used locally. Avoid a design that recompiles the model once per strength value if a tensor-valued runtime mask is already supported.
+10. Locate existing tests for conditioning masks, IC-LoRA, samplers, and denoisers before deciding file placement.
+
+Write a short discovery section to the implementation log before making material edits. If the local topology invalidates the proposed approach, explain why and implement the closest architecture-correct equivalent. Do not force upstream code onto the local repository.
+
+Likely files and adaptation rules
+=================================
+
+In the current public LTX-2 layout, relevant responsibilities are approximately:
+
+    packages/ltx-pipelines/src/ltx_pipelines/ic_lora.py
+        Pipeline configuration and Stage 1 denoiser selection.
+
+    packages/ltx-pipelines/src/ltx_pipelines/utils/denoisers.py
+        Per-transformer-evaluation denoiser call; suitable location for a scheduled source denoiser.
+
+    packages/ltx-pipelines/src/ltx_pipelines/utils/conditioning_schedules.py
+        Suggested new module for reusable conditioning-strength schedules.
+
+    packages/ltx-pipelines/src/ltx_pipelines/iclora_utils.py
+        Source-video conditioning and static attention-mask preparation.
+
+    packages/ltx-core/src/ltx_core/conditioning/mask_utils.py
+    packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
+        Existing mask semantics and conversion to additive attention bias.
+
+    packages/ltx-pipelines/src/ltx_pipelines/utils/samplers.py
+    packages/ltx-core/src/ltx_core/components/schedulers.py
+        Normally inspect but do not modify. These own the denoising trajectory/solver, not source strength.
+
+Map these responsibilities to the local code. Modify the smallest architecture-correct set of files. Do not create or edit packages/ltx-core/src/ltx_core/components/schedulers.py merely because this feature is called a schedule. A conditioning schedule should initially live near IC-LoRA/pipeline guidance. Promote it to a generic core guidance module only if the local code already has an appropriate abstraction or multiple pipelines will reuse it.
+
+Required implementation
+=======================
+
+1. Add an explicit source-strength schedule abstraction.
+
+It should support at least:
+
+    constant strength               baseline and backward compatibility
+    explicit per-evaluation values  precise distilled-model ablations
+    sigma-based smooth ramp         reusable across different step counts
+
+A suitable conceptual interface is:
+
+    g = schedule(
+        sigma=current_model_sigma,
+        progress=normalized_sampling_progress,
+        evaluation_index=model_evaluation_index,
+        num_evaluations=known_or_estimated_total,
+    )
+
+Use local naming and typing conventions. Validate finite values and the supported range. Initially support 0 <= g <= 1 unless the local system already supports amplification safely. Define g=0 as fully blocking the scheduled source interaction, and g=1 as the exact existing baseline.
+
+Prefer sigma/progress semantics for reusable schedules. An explicit value list is still required because the distilled LTX-2.3 pipeline may use very few, nonuniform evaluations. Be precise about whether progress is based on solver steps, sigma distance, or model evaluations.
+
+2. Apply g at every actual transformer evaluation.
+
+Do not compute it only once while building conditionings. The varying mask/bias must reach each model call. This matters for solvers that make multiple model evaluations per nominal step. If the local solver performs substeps or midpoint evaluations, schedule according to the sigma of each model evaluation when available, and log those evaluations.
+
+Preferred initial behavior:
+
+    target queries -> source keys: multiply existing strength by g_i
+    source queries -> target keys: multiply existing strength by g_i
+
+This symmetric schedule best matches a pre-existing symmetric static conditioning-strength feature and isolates the timestep variable. Implement target-query-only scheduling only as a separate experimental mode, not silently as the default.
+
+Never alter unrelated attention blocks, including:
+
+    target <-> target
+    first-frame in-place target tokens <-> other target tokens
+    source <-> source
+    text cross-attention
+    video/audio cross-modality attention
+    other reference groups
+
+If a pre-existing spatial/temporal source mask M_source exists, the effective strength should be:
+
+    M_effective_i = M_source * g_i
+
+Do not replace M_source with a scalar.
+
+3. Preserve backward compatibility.
+
+With the feature unset, disabled, or configured as constant 1.0:
+
+    - behavior must follow the old code path as closely as practical;
+    - outputs with the same seed/settings should be bitwise identical when feasible, otherwise numerically equivalent within a documented tolerance;
+    - no extra transformer passes should occur;
+    - existing CLI/API calls must continue to work;
+    - existing spatial conditioning masks must keep working.
+
+Avoid constructing a dense T x T attention matrix each step if the local implementation has a more memory-efficient mask/bias representation. If dense masks are already used, clone/mutate only what is necessary and document memory cost.
+
+4. Expose the feature through the newest actually supported pipeline interface.
+
+Follow local API/CLI conventions. Good user-facing controls may include:
+
+    --source-strength-schedule constant|values|sigma-ramp
+    --source-strength 1.0
+    --source-strength-values 1,1,1,1,1,1,0.75,0.30
+    --source-strength-early 1.0
+    --source-strength-late 0.30
+    --source-strength-fade-start-sigma 0.725
+    --source-strength-fade-end-sigma 0.421875
+    --source-strength-routing symmetric|target-queries-only
+
+These names are examples. Adapt them to the local interface and avoid redundant or conflicting flags. Define precedence and validation clearly. If config files/dataclasses are canonical locally, support them instead of adding ad hoc CLI parsing.
+
+5. Add observability.
+
+For each run, record at minimum:
+
+    evaluation index
+    nominal solver step index
+    current sigma/timestep
+    next sigma when applicable
+    normalized progress
+    g_source
+    routing mode
+    target token range/count
+    source token range/count
+    whether a pre-existing conditioning mask was composed
+    number of transformer evaluations
+
+Avoid excessive default console noise. Put detailed values in the experiment manifest/log or behind verbose/debug logging.
+
+Testing requirements
+====================
+
+Add or adapt unit/integration tests covering:
+
+1. Constant schedule:
+   g=1 reproduces the existing mask and baseline output/path.
+
+2. Hard disable:
+   g=0 blocks only the intended target/source interaction and does not create NaNs or all-masked query rows.
+
+3. Intermediate strength:
+   g in (0,1) is converted according to local semantics; if log-space is used, confirm the intended additive log(g) bias.
+
+4. Mask composition:
+   a spatial/temporal mask is multiplied by g and not overwritten.
+
+5. Token boundaries:
+   first-frame/in-place target tokens remain in the target group; only the appended IC-LoRA source group is scheduled. Cover any locally supported multiple-condition layout.
+
+6. Schedule validation:
+   reject invalid length, NaN/Inf, out-of-range values, reversed ramp boundaries when unsupported, and mismatched evaluation counts with a useful error.
+
+7. Different step counts/sigmas:
+   sigma-based schedules behave consistently when the number of inference steps changes.
+
+8. Multiple model evaluations per step, if supported:
+   each evaluation uses its own sigma and strength.
+
+9. Runtime modes used locally:
+   run the relevant smoke test under compile/offload/quantization/multi-GPU modes that are actually part of this project, or document why a mode could not be tested.
+
+10. Pipeline smoke test:
+    execute a minimal real or mocked IC-LoRA generation through the newest local pipeline interface.
+
+Implementation and change log
+=============================
+
+Maintain a human-readable log in the repository, choosing a location consistent with local conventions. If no convention exists, use:
+
+    artifacts/timestep_source_strength/IMPLEMENTATION_LOG.md
+
+The log must contain:
+
+1. Repository discovery
+   - commit/branch and dirty-worktree note;
+   - relevant local architecture and differences from upstream assumptions;
+   - actual entry point and token layout;
+   - actual sigma schedule and number of transformer evaluations.
+
+2. Design decision
+   - where the schedule abstraction lives and why;
+   - where g is applied;
+   - mask semantics;
+   - symmetric versus target-only choice;
+   - backward-compatibility approach;
+   - known risks.
+
+3. File-by-file changes
+   - each modified/added file;
+   - concise description of the change;
+   - relevant public API/config additions.
+
+4. Verification
+   - commands run;
+   - test results;
+   - failures and resolutions;
+   - unsupported/unavailable checks.
+
+5. Experiment summary
+   - experiment IDs and output directories;
+   - settings, seeds, inputs, schedules, metrics;
+   - concise findings and recommended default.
+
+6. Usage of the newest modified pipeline
+   - exact working CLI command copied from a successfully executed run;
+   - exact Python API example if Python usage is supported;
+   - checkpoint and IC-LoRA compatibility requirements;
+   - explanation of every new option;
+   - how to reproduce the old baseline;
+   - where outputs and manifests are written.
+
+Do not report commands that were not actually run as verified commands. Clearly label illustrative commands if execution was impossible.
+
+Experiment objective
+====================
+
+Determine whether strong-early/weak-late source access improves the desired tradeoff:
+
+    retain source motion/camera/geometry
+    while reducing source appearance leakage
+    and preserving the first-frame/reference appearance
+
+The local Codex is authorized to design and run a bounded, reproducible experiment suite using locally available test assets, checkpoints, compute, and metrics. Inspect resource availability first. Start with a cheap pilot, confirm the implementation and outputs, then run the full planned matrix that is feasible. Do not download large models or datasets, overwrite user results, or launch an unexpectedly large/long job without following local project policy and clearly recording the limitation.
+
+Required experimental conditions
+================================
+
+At minimum compare these conceptual schedules. Adapt list length to the actual number of model evaluations; if the default distilled Stage 1 has eight evaluations, use the exact vectors below.
+
+A. Baseline constant:
+
+    [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]
+
+B. Conservative late attenuation:
+
+    [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.75, 0.50]
+
+C. Recommended initial schedule:
+
+    [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.75, 0.30]
+
+D. Aggressive late attenuation:
+
+    [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.50, 0.10]
+
+E. Early-only source, hard cutoff:
+
+    Source enabled for approximately the first 50% of actual model evaluations and disabled afterward.
+
+F. Reverse diagnostic:
+
+    Weak early and strong late. Choose a vector/curve that approximately reverses condition C. This is not expected to be good; it tests whether improvements are genuinely direction-dependent.
+
+G. Sigma-based smooth ramp:
+
+    early_strength = 1.0
+    late_strength  = 0.30
+
+Choose fade boundaries based on the actual sigma schedule. Ensure at least two evaluated sigma values fall inside or at the ramp where possible. Remember that the terminal sigma may be a solver destination with no transformer evaluation, so do not design a curve whose late value is never used.
+
+H. Optional routing ablation after the main matrix:
+
+    symmetric target<->source scheduling
+    versus
+    target-query->source-key-only scheduling
+
+Do not mix routing ablations into the initial schedule comparison unless compute permits.
+
+If the local pipeline has a different evaluation count or non-Euler solver, preserve the concepts rather than mechanically truncating the vectors. Write the resolved per-evaluation sigma and g values into every run manifest.
+
+Experimental design
+===================
+
+1. Inputs
+
+Use at least two representative source/reference pairs if available:
+
+    Pair 1: source previz has conspicuously different color/material/texture from the edited first frame.
+    Pair 2: source contains meaningful camera or subject motion that must be preserved.
+
+Prefer three or more pairs if affordable, covering static camera, camera motion, articulated subject motion, occlusion, and disocclusion. Use identical prompt, negative prompt, seed, resolution, frame count, frame rate, solver, checkpoint, LoRA, and decoding settings across schedules for each pair.
+
+2. Seeds
+
+Use a pilot with one fixed seed. For the feasible full suite, use at least three fixed seeds per pair if resources allow. If compute only permits one seed, label findings preliminary.
+
+3. Outputs
+
+Use a non-destructive, timestamped or run-ID-based structure, for example:
+
+    artifacts/timestep_source_strength/
+        IMPLEMENTATION_LOG.md
+        experiment_plan.yaml
+        environment.json
+        runs/
+            <run_id>/
+                manifest.json
+                command.txt
+                stdout.log
+                stderr.log
+                output.mp4
+                frames/
+                metrics.json
+                schedule.csv
+        comparisons/
+            contact_sheets/
+            side_by_side/
+        summary.csv
+        RESULTS.md
+
+Adapt to repository conventions. Never overwrite an existing run; resume or create a new run ID.
+
+4. Required manifest fields
+
+Record enough information for exact reproduction:
+
+    git commit and dirty status
+    date/time
+    hardware and software versions
+    checkpoint and hash/path identifier
+    LoRA(s), weights/strengths, and identifiers
+    input paths and preferably content hashes
+    prompt/negative prompt
+    seed
+    output shape and frame rate
+    solver and complete sigma list
+    schedule type and parameters
+    resolved g value for every transformer evaluation
+    routing mode
+    all existing source/reference strengths and masks
+    runtime/optimization flags
+    wall time and peak memory when measurable
+    output paths
+    metric values and metric versions
+
+5. Measurements
+
+Use locally available, appropriate metrics. Document exact implementations and preprocessing. At minimum try to measure:
+
+Motion/control retention:
+    - optical-flow similarity or endpoint/cosine agreement with source;
+    - point-track trajectory agreement;
+    - camera-motion/trajectory agreement if available;
+    - temporal alignment and gross pose/layout agreement.
+
+First-frame/reference appearance retention:
+    - DINO/DINOv2 or another suitable image-feature similarity between generated frames and the edited first-frame/reference;
+    - color-histogram or palette similarity to the first-frame/reference;
+    - optional subject/identity metric when relevant and valid.
+
+Source appearance leakage:
+    - feature similarity to source RGB frames relative to similarity to the reference;
+    - color/palette similarity to source relative to the reference;
+    - texture/material proxy if a locally validated metric exists.
+
+Quality/stability:
+    - temporal consistency or flicker;
+    - aesthetic/quality score if locally available;
+    - NaN/Inf checks, blank-frame checks, decoding failures;
+    - manual visual notes on motion, shape, colors, materials, texture, identity, and artifacts.
+
+Metrics are proxies. Do not claim semantic material disentanglement from a single embedding score. Produce side-by-side videos and/or aligned contact sheets for human evaluation when tooling permits.
+
+6. Analysis
+
+Create summary tables grouped by input pair and seed. Compare every schedule to constant g=1. Report both absolute metrics and deltas. Look for a Pareto tradeoff rather than selecting solely by one score:
+
+    maximize motion/control retention
+    maximize reference appearance retention
+    minimize source appearance leakage
+    maintain visual quality and temporal stability
+
+Explicitly test these hypotheses:
+
+    H1: reducing source strength only in the last evaluations reduces texture/color/material leakage.
+    H2: early source access preserves motion better than constant low source strength.
+    H3: aggressive cutoff harms correspondence, occlusion handling, or temporal stability.
+    H4: reverse scheduling increases source appearance leakage or reduces the desired tradeoff.
+
+Inspect whether the last model evaluation dominates changes under the actual solver. For an Euler RF step ending at sigma_next=0, the final latent may equal the current x0 estimate, making the final g particularly influential. Verify this from the local solver rather than assuming it.
+
+Final required deliverables
+===========================
+
+Complete the task only after producing:
+
+1. Working timestep-dependent source-strength implementation adapted to the local repository.
+2. Automated tests and their results.
+3. Backward-compatibility verification for constant g=1.
+4. A documented newest-pipeline CLI/API usage example that was actually exercised when resources allowed.
+5. IMPLEMENTATION_LOG.md containing discovery, design, file-by-file changes, commands, and verification.
+6. Reproducible experiment plan and per-run manifests.
+7. Saved generated outputs, metrics, schedules, logs, and comparison media.
+8. RESULTS.md plus a machine-readable summary.csv/json.
+9. A concise final Codex response stating:
+   - what changed;
+   - where it changed;
+   - tests passed/failed;
+   - experiments completed/skipped and why;
+   - key quantitative and visual findings;
+   - recommended default schedule, or an explicit statement that evidence is insufficient;
+   - exact paths to implementation log, usage documentation, results, and sample outputs.
+
+Guardrails
+==========
+
+- Preserve unrelated user changes in a dirty worktree.
+- Do not reset, discard, or overwrite user work.
+- Do not modify the RF sigma scheduler merely to implement conditioning strength.
+- Do not add a new LoRA or retrain model weights; this feature is inference-time only.
+- Do not silently change the first-frame conditioning, text guidance, solver, RoPE, or layer routing.
+- Do not confuse source-token denoise strength with source attention strength.
+- Do not assume upstream filenames, token order, step count, or mask layout.
+- Do not claim experiments ran if they did not.
+- Do not hide failed runs; retain failure logs and identify them clearly.
+- Do not choose a default schedule from one attractive cherry-picked output. Use the complete feasible comparison set and disclose limitations.
+
+Suggested execution order
+=========================
+
+1. Inspect instructions, repository, runtime, pipeline, token layout, masks, and denoising path.
+2. Write the discovery section of IMPLEMENTATION_LOG.md and the initial experiment plan.
+3. Implement a constant schedule and prove g=1 backward compatibility.
+4. Implement explicit-value and sigma-ramp schedules at every transformer evaluation.
+5. Add CLI/config/API integration and observability.
+6. Add and run unit/integration tests.
+7. Run a one-input, one-seed baseline versus recommended-schedule pilot.
+8. Inspect outputs and logs for correctness, NaNs, mask mistakes, and unintended token routing.
+9. Run the feasible full schedule matrix using fixed paired settings.
+10. Compute metrics and create comparison media.
+11. Write RESULTS.md, summary tables, exact verified usage, and final implementation log.
+12. Review git diff and ensure only intentional files changed before reporting completion.
+

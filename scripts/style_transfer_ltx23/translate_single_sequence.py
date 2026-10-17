@@ -325,7 +325,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-2-noise-area-fraction", type=float, default=0.05)
     parser.add_argument("--stage-2-noise-alpha", type=int, default=3)
     parser.add_argument("--stage-2-noise-gamma", type=float, default=5.0)
-    parser.add_argument("--stage-2-noise-phase-source", choices=("stage1",), default="stage1")
+    parser.add_argument("--stage-2-noise-phase-source", choices=("stage1", "source_video"), default="stage1")
     parser.add_argument("--stage-2-start-sigma", type=float, default=0.909375)
     parser.add_argument("--stage-2-noise-diagnostics", default=None)
     parser.add_argument("--skip-stage-2", action="store_true")

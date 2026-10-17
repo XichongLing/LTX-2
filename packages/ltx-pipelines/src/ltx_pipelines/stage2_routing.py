@@ -437,7 +437,9 @@ def run_routed_stage2(  # noqa: PLR0913,PLR0915
     recorder: Stage2PredictionRecorder | None = None,
     video_denoise_mask: torch.Tensor | None = None,
     stage_2_noise_config: Stage2NoiseConfig | None = None,
+    stage_2_noise_reference_latent: torch.Tensor | None = None,
     video_branch_runtime_lora: bool = True,
+    image_branch_ic_lora: bool = False,
 ) -> tuple[LatentState, LatentState]:
     """Run Stage 2 with one shared video trajectory and branch-local audio."""
 
@@ -450,6 +452,7 @@ def run_routed_stage2(  # noqa: PLR0913,PLR0915
     source_generator = torch.Generator(device=initial_video_latent.device).manual_seed(noise_seed + 1)
     audio_generator = torch.Generator(device=initial_audio_latent.device).manual_seed(noise_seed + 2)
     stage_2_noise_config = stage_2_noise_config or Stage2NoiseConfig()
+    stage_2_noise_reference_latent = initial_video_latent if stage_2_noise_reference_latent is None else stage_2_noise_reference_latent
 
     image_state = create_noised_state(
         tools=video_tools,
@@ -457,7 +460,7 @@ def run_routed_stage2(  # noqa: PLR0913,PLR0915
         noiser=make_stage2_noiser(
             generator=target_generator,
             video_tools=video_tools,
-            reference_latent=initial_video_latent,
+            reference_latent=stage_2_noise_reference_latent,
             config=stage_2_noise_config,
         ),
         dtype=initial_video_latent.dtype,
@@ -504,7 +507,7 @@ def run_routed_stage2(  # noqa: PLR0913,PLR0915
         image_audio_x0 = None
         video_audio_x0 = None
         if mode in (Stage2BranchMode.IMAGE, Stage2BranchMode.GLOBAL, Stage2BranchMode.SPATIAL):
-            with runtime_lora_scale(transformer, 0.0):
+            with runtime_lora_scale(transformer, 1.0 if image_branch_ic_lora else 0.0):
                 image_result, image_audio_result = image_denoiser(
                     transformer, image_state, image_audio_state, sigmas, step_index
                 )
@@ -608,6 +611,7 @@ def run_dual_trajectory_stage2(  # noqa: PLR0912,PLR0913,PLR0915
     recorder: Stage2PredictionRecorder | None = None,
     video_denoise_mask: torch.Tensor | None = None,
     stage_2_noise_config: Stage2NoiseConfig | None = None,
+    stage_2_noise_reference_latent: torch.Tensor | None = None,
     video_branch_runtime_lora: bool = True,
 ) -> tuple[LatentState, LatentState]:
     """Run independent video-anchor and image-edit trajectories with optional KV guidance."""
@@ -629,6 +633,7 @@ def run_dual_trajectory_stage2(  # noqa: PLR0912,PLR0913,PLR0915
     source_generator = torch.Generator(device=initial_video_latent.device).manual_seed(noise_seed + 1)
     audio_generator = torch.Generator(device=initial_audio_latent.device).manual_seed(noise_seed + 2)
     stage_2_noise_config = stage_2_noise_config or Stage2NoiseConfig()
+    stage_2_noise_reference_latent = initial_video_latent if stage_2_noise_reference_latent is None else stage_2_noise_reference_latent
     reference_values = (reference_tools, initial_reference_latent, reference_denoiser, reference_controller)
     has_any_reference_value = any(value is not None for value in reference_values)
     has_all_reference_values = all(value is not None for value in reference_values)
@@ -643,7 +648,7 @@ def run_dual_trajectory_stage2(  # noqa: PLR0912,PLR0913,PLR0915
         noiser=make_stage2_noiser(
             generator=target_generator,
             video_tools=video_tools,
-            reference_latent=initial_video_latent,
+            reference_latent=stage_2_noise_reference_latent,
             config=stage_2_noise_config,
         ),
         dtype=initial_video_latent.dtype,

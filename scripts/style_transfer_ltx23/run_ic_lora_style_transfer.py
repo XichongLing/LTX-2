@@ -26,6 +26,7 @@ from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDO
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_pipelines import ICLoraPipeline
 from ltx_pipelines.reference_partition import Stage1ReferencePartitionConfig
+from ltx_pipelines.stage1_phi_noise import Stage1PhiNoiseConfig
 from ltx_pipelines.stage2_noise import (
     Stage2NoiseBundle,
     Stage2NoiseConfig,
@@ -425,6 +426,15 @@ def parse_args() -> argparse.Namespace:
         help="Preprocessed dress mask used by spatial Stage-2 routing (M=1 in the dress region).",
     )
     parser.add_argument(
+        "--stage-2-routing-mask-mode",
+        choices=("soft", "hard"),
+        default="soft",
+        help=(
+            "How the routing mask weights the Stage-2 latent blend. 'soft' area/mean-pools the mask to "
+            "fractional token weights; 'hard' uses the binary max-pooled tokens shared with KV partition."
+        ),
+    )
+    parser.add_argument(
         "--stage-2-dress-video-contribution",
         type=float,
         default=None,
@@ -436,6 +446,38 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Independent Stage-2 noise seed. Defaults to --seed.",
     )
+    parser.add_argument("--phi-noise-temporal", action="store_true", help="Enable Stage-1 Phi-noise.")
+    parser.add_argument(
+        "--phi-transform",
+        choices=("temporal", "spatial"),
+        default="temporal",
+        help="Stage-1 Phi-noise FFT transform. Temporal is the original default; spatial uses per-frame 2D FFT.",
+    )
+    parser.add_argument("--phi-k", type=int, default=1, help="Highest inclusive temporal rfft bin replaced by temporal Phi-noise.")
+    parser.add_argument("--phi-gamma", type=float, default=30.0, help="Stage-1 Phi-noise low-band attenuation gamma.")
+    parser.add_argument(
+        "--phi-energy-scope",
+        choices=("global", "per-series"),
+        default="global",
+        help="Energy compensation scope for Stage-1 temporal Phi-noise.",
+    )
+    parser.add_argument("--phi-exclude-frame0", action="store_true", help="Leave latent frame 0 noise unchanged and FFT frames 1..T-1 for temporal Phi-noise.")
+    parser.add_argument(
+        "--phi-mask-mode",
+        choices=("area_fraction", "official_alpha"),
+        default="area_fraction",
+        help="Spatial Phi-noise low-frequency mask parameterization.",
+    )
+    parser.add_argument("--phi-area-fraction", type=float, default=0.05, help="Spatial Phi-noise requested low-frequency area fraction.")
+    parser.add_argument("--phi-alpha", type=int, default=3, help="Spatial Phi-noise official-alpha mask exponent.")
+    parser.add_argument(
+        "--phi-phase-source",
+        choices=("source", "own"),
+        default="source",
+        help="Phase source for Stage-1 Phi-noise; 'own' is the gamma/beta reweighting control.",
+    )
+    parser.add_argument("--phi-source-latent", default=None, help="Optional cached Stage-1 source latent (.pt or .safetensors).")
+    parser.add_argument("--phi-noise-log", default=None, help="Optional JSON path for Stage-1 Phi-noise diagnostics.")
     parser.add_argument(
         "--stage-2-noise-mode",
         choices=("gaussian", "phi", "raw_reference_coefficients", "matched_reference_coefficients"),
@@ -458,7 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage-2-noise-alpha", type=int, default=3)
     parser.add_argument("--stage-2-noise-gamma", type=float, default=5.0)
     parser.add_argument(
-        "--stage-2-noise-phase-source", choices=("stage1",), default="stage1"
+        "--stage-2-noise-phase-source", choices=("stage1", "source_video"), default="stage1"
     )
     parser.add_argument(
         "--stage-2-start-sigma",
@@ -477,6 +519,14 @@ def parse_args() -> argparse.Namespace:
         "--stage-2-prediction-dir",
         default=None,
         help="Optional directory for per-step image/video/routed X0 safetensors and metrics.",
+    )
+    parser.add_argument(
+        "--stage-2-image-ic-lora",
+        action="store_true",
+        help=(
+            "Enable runtime IC-LoRA on the routed image branch (image/global/spatial modes). The branch "
+            "still receives no source-video tokens. Off by default, matching the historical image branch."
+        ),
     )
     parser.add_argument(
         "--stage-2-dual-image-ic-lora",
@@ -939,6 +989,19 @@ def build_stage_2_cache_metadata(
             "fade_start": args.first_frame_attention_fade_start_sigma,
             "fade_end": args.first_frame_attention_fade_end_sigma,
         },
+        "stage_1_phi_noise": {
+            "enabled": args.phi_noise_temporal,
+            "transform": args.phi_transform,
+            "k": args.phi_k,
+            "gamma": args.phi_gamma,
+            "energy_scope": args.phi_energy_scope,
+            "exclude_frame0": args.phi_exclude_frame0,
+            "phase_source": args.phi_phase_source,
+            "mask_mode": args.phi_mask_mode,
+            "area_fraction": args.phi_area_fraction,
+            "alpha": args.phi_alpha,
+            "source_latent": str(Path(args.phi_source_latent).expanduser().resolve()) if args.phi_source_latent else None,
+        },
     }
     fingerprint = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
     return {"cache_version": 1, "stage_1_fingerprint": fingerprint, "stage_1_config": config}
@@ -946,6 +1009,22 @@ def build_stage_2_cache_metadata(
 
 def main() -> None:
     args = parse_args()
+
+    stage_1_phi_noise_diagnostics: list[dict[str, object]] = []
+    stage_1_phi_noise_config = Stage1PhiNoiseConfig(
+        enabled=args.phi_noise_temporal,
+        transform=args.phi_transform,
+        k=args.phi_k,
+        gamma=args.phi_gamma,
+        energy_scope=args.phi_energy_scope,
+        exclude_frame0=args.phi_exclude_frame0,
+        phase_source=args.phi_phase_source,
+        mask_mode=args.phi_mask_mode,
+        area_fraction=args.phi_area_fraction,
+        alpha=args.phi_alpha,
+        source_latent_path=args.phi_source_latent,
+        diagnostics_sink=stage_1_phi_noise_diagnostics,
+    )
 
     stage_2_noise_diagnostics: list[dict[str, object]] = []
     if args.stage_2_noise_bundle_load and args.stage_2_noise_bundle_save:
@@ -1072,10 +1151,14 @@ def main() -> None:
             raise ValueError("--stage-2-dress-video-contribution must be between 0.0 and 1.0.")
     elif args.stage_2_routing_mask is not None:
         raise ValueError("--stage-2-routing-mask is only valid with spatial or dual Stage-2 routing.")
+    if args.stage_2_routing_mask_mode != "soft" and args.stage_2_routing_mask is None:
+        raise ValueError("--stage-2-routing-mask-mode requires --stage-2-routing-mask.")
     if args.stage_2_branch_mode != "dual" and args.stage_2_kv_mode != "none":
         raise ValueError("--stage-2-kv-mode is only valid with --stage-2-branch-mode dual.")
     if args.stage_2_branch_mode != "dual" and args.stage_2_dual_image_ic_lora:
         raise ValueError("--stage-2-dual-image-ic-lora is only valid with --stage-2-branch-mode dual.")
+    if args.stage_2_image_ic_lora and args.stage_2_branch_mode not in {"image", "global", "spatial"}:
+        raise ValueError("--stage-2-image-ic-lora is only valid with image, global, or spatial Stage-2 routing.")
     if args.stage_2_kv_include_inside_mask:
         args.stage_2_kv_anchor_region = "all"
     if args.stage_2_branch_mode != "dual" and args.stage_2_kv_include_inside_mask:
@@ -1180,7 +1263,7 @@ def main() -> None:
     )
     stage_2_loras = []
     stage_2_runtime_loras = []
-    if args.stage_2_ic_lora_strength > 0.0 or controlled_stage_2:
+    if args.stage_2_ic_lora_strength > 0.0:
         stage_2_adapter = LoraPathStrengthAndSDOps(
             path=lora.path,
             strength=args.stage_2_ic_lora_strength,
@@ -1305,6 +1388,7 @@ def main() -> None:
                     "stage_2_branch_mode": args.stage_2_branch_mode,
                     "stage_2_video_mix": args.stage_2_video_mix,
                     "stage_2_routing_mask": args.stage_2_routing_mask,
+                    "stage_2_routing_mask_mode": args.stage_2_routing_mask_mode,
                     "stage_2_dress_video_contribution": args.stage_2_dress_video_contribution,
                     "stage_2_noise_seed": args.stage_2_noise_seed if args.stage_2_noise_seed is not None else args.seed,
                     "video_strength": args.video_strength,
@@ -1417,13 +1501,22 @@ def main() -> None:
         stage_2_branch_mode=args.stage_2_branch_mode,
         stage_2_video_mix=args.stage_2_video_mix,
         stage_2_routing_mask=stage_2_routing_mask,
+        stage_2_routing_mask_mode=args.stage_2_routing_mask_mode,
         stage_2_dress_video_contribution=args.stage_2_dress_video_contribution,
         stage_2_noise_seed=args.stage_2_noise_seed,
         stage_2_noise_config=stage_2_noise_config,
+        stage_2_noise_source_video=str(Path(args.conditioning_video).expanduser().resolve())
+        if args.stage_2_noise_phase_source == "source_video"
+        else None,
+        stage_1_phi_noise_config=stage_1_phi_noise_config,
+        stage_1_phi_noise_source_video=str(Path(args.conditioning_video).expanduser().resolve())
+        if args.phi_noise_temporal and args.phi_phase_source == "source" and not args.phi_source_latent
+        else None,
         stage_2_sigmas=stage_2_sigmas,
         stage_2_prediction_dir=args.stage_2_prediction_dir,
         stage_2_kv_mode=args.stage_2_kv_mode,
         stage_2_dual_image_ic_lora=args.stage_2_dual_image_ic_lora,
+        stage_2_image_ic_lora=args.stage_2_image_ic_lora,
         stage_2_kv_include_inside_mask=args.stage_2_kv_include_inside_mask,
         stage_2_kv_anchor_region=args.stage_2_kv_anchor_region,
         stage_2_kv_strength=args.stage_2_kv_strength,
@@ -1460,6 +1553,30 @@ def main() -> None:
         video_chunks_number=output_chunks,
     )
 
+    if args.skip_stage_2:
+        stage1_manifest = {
+            "stage": 1,
+            "skip_stage_2": True,
+            "seed": args.seed,
+            "width": width,
+            "height": height,
+            "num_frames": num_frames,
+            "frame_rate": frame_rate,
+            "reference_video": str(Path(args.reference_video).expanduser().resolve()),
+            "conditioning_video": str(Path(args.conditioning_video).expanduser().resolve()),
+            "reference_image": str(Path(args.reference_image).expanduser().resolve()) if args.reference_image else None,
+            "reference_downscale_factor_override": args.reference_downscale_factor_override,
+            "stage_1_ic_lora_strength": args.stage_1_ic_lora_strength,
+            "phi_noise": stage_1_phi_noise_config.manifest_dict(),
+            "phi_noise_diagnostics": stage_1_phi_noise_diagnostics,
+            "output": str(output_path),
+            "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(),
+        }
+        stage1_manifest_path = output_path.with_suffix(output_path.suffix + ".stage1.json")
+        stage1_manifest_path.write_text(json.dumps(stage1_manifest, indent=2, sort_keys=True) + "\n")
+        print(f"Wrote Stage-1 run manifest to {stage1_manifest_path}")
+
     if not args.skip_stage_2:
         if cache_manifest is None and args.save_stage_2_input:
             cache_path = Path(args.save_stage_2_input).expanduser().resolve()
@@ -1470,6 +1587,7 @@ def main() -> None:
             "stage_2_routing_mask": (
                 str(Path(args.stage_2_routing_mask).expanduser().resolve()) if args.stage_2_routing_mask else None
             ),
+            "stage_2_routing_mask_mode": args.stage_2_routing_mask_mode,
             "stage_2_dress_video_contribution": args.stage_2_dress_video_contribution,
             "stage_2_ic_lora_strength": args.stage_2_ic_lora_strength,
             "stage_2_lora_execution": args.stage_2_lora_execution,
@@ -1486,6 +1604,7 @@ def main() -> None:
             "stage_2_prediction_dir": args.stage_2_prediction_dir,
             "stage_2_kv_mode": args.stage_2_kv_mode,
             "stage_2_dual_image_ic_lora": args.stage_2_dual_image_ic_lora,
+            "stage_2_image_ic_lora": args.stage_2_image_ic_lora,
             "stage_2_kv_include_inside_mask": args.stage_2_kv_anchor_region == "all",
             "stage_2_kv_anchor_region": args.stage_2_kv_anchor_region,
             "stage_2_kv_strength": args.stage_2_kv_strength,
@@ -1535,6 +1654,12 @@ def main() -> None:
         diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
         diagnostics_path.write_text(json.dumps(stage_2_noise_diagnostics, indent=2, sort_keys=True) + "\n")
         print(f"Wrote Stage-2 noise diagnostics to {diagnostics_path}")
+
+    if args.phi_noise_log:
+        diagnostics_path = Path(args.phi_noise_log).expanduser().resolve()
+        diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+        diagnostics_path.write_text(json.dumps(stage_1_phi_noise_diagnostics, indent=2, sort_keys=True) + "\n")
+        print(f"Wrote Stage-1 Phi-noise diagnostics to {diagnostics_path}")
 
     if args.source_strength_log:
         log_path = Path(args.source_strength_log).expanduser().resolve()

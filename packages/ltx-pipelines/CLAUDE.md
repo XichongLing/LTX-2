@@ -36,7 +36,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 ## Sigma schedules and step counts
 
 - **Scheduler-based** (full model): `self._scheduler = LTX2Scheduler()` with `execute(steps=N)` (HQ also passes `latent=` for token-count-dependent shift). Defaults: 30 steps (LTX-2.3), 40 (LTX-2), 15 (HQ).
-- **Distilled**: Fixed 8-step `DISTILLED_SIGMA_VALUES` (9 values). Stage 2 uses 3-step `STAGE_2_DISTILLED_SIGMA_VALUES` (4 values). No `num_inference_steps` param.
+- **Distilled**: Fixed 8-step `DISTILLED_SIGMA_VALUES` (9 values). Stage 2 uses 3-step `STAGE_2_DISTILLED_SIGMA_VALUES` (4 values). No `num_inference_steps` param. IC-LoRA source-strength `values` schedules must match the actual transformer evaluation count (8 for default Stage 1, 3 for default Stage 2 when Stage 2 IC-LoRA is enabled).
 - **Retake**: `num_inference_steps=40` default; ignored when `distilled=True` (fixed 8-step).
 - **Overrides**: All pipelines accept optional sigma tensors in `__call__`: `sigmas` (one-stage), `stage_1_sigmas` + `stage_2_sigmas` (two-stage).
 
@@ -65,6 +65,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 - `SimpleDenoiser` -- single forward pass (B=1), no guidance. Used by distilled pipelines and all stage 2.
 - `GuidedDenoiser` -- CFG/STG with static `MultiModalGuider` instances (HQ, A2Vid, Retake non-distilled).
 - `FactoryGuidedDenoiser` -- per-step guider creation via factory (OneStageTI2Vid, TwoStagesTI2Vid, Keyframe).
+- `SourceStrengthScheduledDenoiser` -- wraps another denoiser and scales scheduled IC-LoRA source-video attention blocks plus optional later-target-to-frame-0 attention blocks at each transformer evaluation.
 
 All denoisers return a `(video_result, audio_result)` tuple of `DenoisedLatentResult` (defined in `utils/types.py`), either element may be `None` for absent modalities. `DenoisedLatentResult.denoised` is the final blended tensor. Guided denoisers additionally populate per-pass fields (`.cond`, `.uncond`, `.ptb`, `.mod`) on each result; `SimpleDenoiser` leaves these `None`.
 
@@ -76,7 +77,7 @@ Guided denoisers batch all guidance passes into a **single transformer call**: s
 
 - **HQ**: Res2s second-order sampler for **both** stages, latent-dependent sigma schedule, distilled LoRA on both stages with separate strengths.
 - **A2Vid**: Audio frozen in both stages (`frozen=True, noise_scale=0.0`). Returns original audio (not VAE-decoded); no `AudioDecoder`.
-- **IC-LoRA**: `VideoConditionByReferenceLatent`, `reference_downscale_factor` from LoRA metadata, `skip_stage_2`, attention mask downsampling. Stage 2 is LoRA-free and uses `combined_image_conditionings` (no IC-LoRA conditioning).
+- **IC-LoRA**: `VideoConditionByReferenceLatent`, `reference_downscale_factor` from LoRA metadata, `skip_stage_2`, attention mask downsampling, optional per-evaluation source-video attention schedule (`source_strength_schedule`, `source_strength_routing`, `stage_2_source_strength_schedule`, `source_strength_log`) and optional first-frame attention schedule (`first_frame_attention_schedule`, `stage_2_first_frame_attention_schedule`, `first_frame_attention_log`). Stage 2 is LoRA-free and uses `combined_image_conditionings` by default; if Stage 2 IC-LoRA is enabled, the source schedule is applied there as well.
 - **LipDub**: Standalone pipeline; IC reference **video** helpers in `iclora_utils.py`, LipDub-only **audio** patchify/negative positions in `lipdub.py`. Appends frozen audio-reference tokens via `AudioConditionByReferenceLatent` (ltx-core), matching video token order (`[target | ref]`) while keeping reference RoPE positions negative (training-compatible). Single IC-LoRA on both stages; full IC-LoRA video conditioning at stage 1 and 2; stage-2 audio is frozen with S1 latent as initial state and uses S1-derived ref. Final audio decoded from stage 1 latent. The LipDub CLI does not expose `--conditioning-attention-mask`; use `ic_lora.py` if you need spatial IC attention masking.
 - **Keyframe**: Uses `image_conditionings_by_adding_guiding_latent` in both stages (all frames as keyframe guidance, no replacement) -- unlike TI2Vid which uses `combined_image_conditionings` (frame_idx=0 replaces, others guide).
 - **Retake**: `TemporalRegionMask` for selective time-window regeneration. `regenerate_video`/`regenerate_audio` flags. Conditional distilled/full behavior.
@@ -86,3 +87,9 @@ Guided denoisers batch all guidance passes into a **single transformer call**: s
 
 - `combined_image_conditionings()` -- images with `frame_idx==0` replace latent (`VideoConditionByLatentIndex`), others guide (`VideoConditionByKeyframeIndex`).
 - `image_conditionings_by_adding_guiding_latent()` -- all images become keyframe guidance regardless of `frame_idx`.
+
+## Stage-2 target noise
+
+- `ICLoraPipeline.__call__` accepts `stage_2_noise_config: Stage2NoiseConfig | None`. Gaussian is the backward-compatible default; manipulated modes affect only the Stage-2 target-video prefix.
+- Spatial Φ-Noise lives in `stage2_noise.py`: full float32 `fft2`, corrected `fftfreq` radial masks, per-batch energy balancing, realness checks, and diagnostics. Stage-1 raw upscaled latent is the phase reference; audio, source suffixes, appearance-reference trajectories, prediction conversion, and solver updates are unchanged.
+- Stage 2 may use an overridden first sigma (the stronger-Stage-1 control uses `[0.8, 0.725, 0.421875, 0]`). See `docs/stage2_phi_noise.md` for CLI and ablation details.
